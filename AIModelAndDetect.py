@@ -13,6 +13,8 @@ warnings.filterwarnings('ignore')
 import pprint
 import random
 import ast
+import hashlib
+
 
 #set servertimeout = 10m;
 #set query_results_cache_max_age = 0d;
@@ -30,57 +32,81 @@ def clean_set(domains):
 
 ALERT_CLASSIFICATION = {
     "ALERT_NEW_AI_AGENT_NOT_IN_BASELINE": {
-        "mitre": ["T1059"],  # Command and Scripting Interpreter
+        "mitre": ["T1059"],
         "ai_risk": ["Shadow AI", "Unauthorized AI Deployment"],
         "confidence": "Medium"
     },
     "ALERT_NEW_USER_FOR_PROCESS": {
-        "mitre": ["T1078"],  # Valid Accounts
+        "mitre": ["T1078"],
         "ai_risk": ["Unauthorized AI Usage", "Privilege Abuse"],
         "confidence": "High"
     },
     "ALERT_NEW_DOMAINS": {
-        "mitre": ["T1071.001"],  # Web Protocols
+        "mitre": ["T1071.001"],
         "ai_risk": ["Data Exfiltration", "Unapproved AI Provider"],
         "confidence": "High"
     },
     "ALERT_NEW_IPS": {
-        "mitre": ["T1071"],  # Application Layer Protocol
+        "mitre": ["T1071"],
         "ai_risk": ["Data Exfiltration"],
         "confidence": "High"
     },
+    "ALERT_NEW_PORTS": {
+        "mitre": ["T1046"],
+        "ai_risk": ["Unapproved Service Exposure", "Suspicious Connectivity"],
+        "confidence": "Medium"
+    },
     "ALERT_EXCESSIVE_TRANSFER": {
-        "mitre": ["T1041"],  # Exfiltration Over C2 Channel
+        "mitre": ["T1041"],
         "ai_risk": ["Sensitive Data Leakage"],
         "confidence": "Critical"
     },
+    "ALERT_NEW_DIRECTORIES": {
+        "mitre": ["T1083"],
+        "ai_risk": ["Sensitive Data Discovery"],
+        "confidence": "Medium"
+    },
+    "ALERT_NEW_FILE_EXTENSIONS": {
+        "mitre": ["T1005"],
+        "ai_risk": ["Sensitive Data Access"],
+        "confidence": "Medium"
+    },
+    "ALERT_ACCESSING_MANY_NEW_FILES": {
+        "mitre": ["T1005"],
+        "ai_risk": ["Bulk Data Access"],
+        "confidence": "Medium"
+    },
     "ALERT_NEW_MODEL_FILE_MODIFICATION": {
-        "mitre": ["T1565.001"],  # Stored Data Manipulation
+        "mitre": ["T1565.001"],
         "ai_risk": ["Model Poisoning", "Model Integrity Violation"],
         "confidence": "Critical"
     },
     "ALERT_MODEL_FILE_MODIFIED_BY_NEW_USER": {
-        "mitre": ["T1078", "T1565"],
-        "ai_risk": ["Model Poisoning", "Unauthorized Model Access"],
+        "mitre": ["T1078", "T1565.001"],
+        "ai_risk": ["Unauthorized Model Access", "Model Poisoning"],
         "confidence": "Critical"
     },
     "ALERT_MODEL_FILE_MODIFIED_WITH_UNUSUAL_ARGS": {
-        "mitre": ["T1059", "T1565"],
-        "ai_risk": ["Model Backdooring", "Model Tampering"],
+        "mitre": ["T1059", "T1565.001"],
+        "ai_risk": ["Model Tampering", "Model Backdooring"],
         "confidence": "High"
     },
     "ALERT_NEW_SPAWNED_PROCESS": {
-        "mitre": ["T1059", "T1106"],  # Execution
+        "mitre": ["T1106", "T1059"],
         "ai_risk": ["AI Agent Abuse", "Post-Exploitation"],
         "confidence": "High"
     },
-    "SALERT_PAWNED_PROCESS_UNUSUAL_ARGS": {
+    "SALERT_SPAWNED_PROCESS_UNUSUAL_ARGS": {
         "mitre": ["T1059"],
         "ai_risk": ["Living-off-the-Land via AI"],
         "confidence": "High"
+    },
+    "ALERT_AI_AGENT_IN_LEARNING_PHASE": {
+        "mitre": [],
+        "ai_risk": ["Baseline Learning"],
+        "confidence": "Low"
     }
 }
-
 
 
 
@@ -106,6 +132,28 @@ class AIAgentAnomalyDetector:
         self.kcsb = KustoConnectionStringBuilder.with_az_cli_authentication(cluster_url)
         self.client = KustoClient(self.kcsb)
         
+    def _to_json_str(self, v, max_len: int = 20000) -> str:
+        """Safe stringify for CSV: list/dict/set -> compact JSON; truncate."""
+        if v is None:
+            return ""
+        try:
+            if isinstance(v, set):
+                v = list(v)
+            if isinstance(v, (dict, list, tuple)):
+                s = json.dumps(v, ensure_ascii=False, separators=(",", ":"), default=str)
+            else:
+                s = str(v)
+        except Exception:
+            s = str(v)
+
+        if max_len and len(s) > max_len:
+            return s[:max_len] + "...(truncated)"
+        return s
+    
+    def _alert_id(self, alert: dict, anomaly: dict) -> str:
+        key = f"{alert.get('timestamp')}|{alert.get('machine')}|{alert.get('process')}|{alert.get('pid')}|{anomaly.get('type')}|{anomaly.get('details')}"
+        return hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
+    
     def _make_json_serializable(self, obj):
         """Convert non-serializable objects to JSON-compatible types"""
         import numpy as np
@@ -189,9 +237,90 @@ class AIAgentAnomalyDetector:
 
     def _deobfuscate_user_name(self, user):
         return self._deobfuscate_value(user)
+    
+    def _enrich_anomaly(self, anomaly):
+        classification = ALERT_CLASSIFICATION.get(anomaly.get("type"), {})
+        anomaly["mitre_attack"] = classification.get("mitre", [])
+        anomaly["ai_risk"] = classification.get("ai_risk", [])
+        anomaly["confidence"] = classification.get("confidence", "Unknown")
+        return anomaly 
         
-        
-        
+    def _make_anomaly(
+        self,
+        *,
+        type: str,
+        severity: str,
+        details: str,
+        row=None,
+        baseline=None,
+        df_children=None,
+        normalized_args="",
+        occurrence_count=0,
+        baseline_context=None,
+        extra=None
+    ) -> dict:
+        """
+        Build a fully detailed anomaly and ALWAYS enrich it.
+        """
+
+        baseline_context = baseline_context or {}
+        extra = extra or {}
+
+        # Core identity
+        machine = row.get("MachineName") if row is not None else ""
+        process = row.get("ProcessName") if row is not None else ""
+        user = row.get("UserName", "UNKNOWN") if row is not None else "UNKNOWN"
+        signer = self._normalize_signer(row.get("ProcessSigner")) if row is not None else "ERR:NOT-REPORTED"
+        pid = int(row.get("Pid", 0)) if row is not None and pd.notna(row.get("Pid")) else None
+
+        anomaly = {
+            "type": type,
+            "severity": severity,
+            "details": details,
+
+            # Identity
+            "machine": machine,
+            "process": process,
+            "pid": pid,
+            "user": user,
+            "signer": signer,
+
+            # Context
+            "baseline_context": baseline_context,
+
+            # Observed behavior (max detail, safe)
+            "observed": {
+                "process_dir": row.get("ProcessDir") if row is not None else None,
+                "process_args": str(row.get("ProcessArgs", ""))[:2000] if row is not None else "",
+                "normalized_args": normalized_args,
+                "contacted_domains": self._safe_parse_list(row.get("contacted_domains")) if row is not None else [],
+                "contacted_ips": self._safe_parse_list(row.get("contacted_ips")) if row is not None else [],
+                "contacted_ports": self._safe_parse_list(row.get("contacted_ports")) if row is not None else [],
+                "accessed_files": self._safe_parse_list(row.get("accessed_files")) if row is not None else [],
+                "accessed_dirs": self._safe_parse_list(row.get("accessed_dirs")) if row is not None else [],
+                "modified_model_files": self._safe_parse_list(row.get("modified_model_files")) if row is not None else [],
+                "network_bytes_sent": int(row.get("NetworkBytesSent_sum", 0)) if row is not None else 0,
+                "network_bytes_received": int(row.get("NetworkBytesReceived_sum", 0)) if row is not None else 0,
+                "ai_score": float(row.get("aiScore_avg", 0)) if row is not None else 0.0,
+            }
+        }
+
+        # Optional: baseline snapshot
+        if baseline:
+            anomaly["baseline_snapshot"] = {
+                "occurrence_count": occurrence_count,
+                "baseline_users": list(baseline.get("users", set())),
+                "baseline_domains": list(baseline.get("contacted_domains", set())),
+                "baseline_dirs": list(baseline.get("accessed_dirs", set())),
+                "baseline_spawned_processes": list(baseline.get("spawned_processes", set())),
+            }
+
+        # Optional: caller extras
+        anomaly.update(extra)
+
+        # 🔐 ALWAYS enrich here
+        return self._enrich_anomaly(anomaly)
+    
         
     def _normalize_filename(self, filename):
         """Normalize filenames to remove variable parts"""
@@ -414,12 +543,12 @@ let CommonDevOrBrowserProcesses = dynamic(["chrome.exe", "msedge.exe", "firefox.
 let LocalhostAddresses = dynamic(["127.0.0.1", "::1"]);
 let CommonAIServingPorts = dynamic([11434, 7860, 5000, 5001, 8000, 8001, 8080, 8888, 8889,443, 9000, 9001,3000]);
 let LLMApiPathFragments = dynamic(["/sse", "/mcp/v1", "/events" ,"/v1/chat/completions", "/openai/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/v1/images", "/v1/audio/transcriptions", "/responses", "/v1beta/models", ":generatecontent", "/dashscope/", "/chat/completions"]);
-let LLMApiDomains = dynamic(["api.openai.com", "openai.azure.com", "api.anthropic.com", "claude.ai", "claude.com", "generativelanguage.googleapis.com", "aiplatform.googleapis.com", "api.mistral.ai", "api.perplexity.ai", "pplx-api.perplexity.ai", "api.cohere.ai", "api.x.ai", "llama.developer.meta.com", "api.deepseek.com", "dashscope.aliyuncs.com", "qwen-api.aliyuncs.com", "openrouter.ai", "api.together.xyz", "api.fireworks.ai", "api.groq.com"]);
-let KnownAIServingProcessNames = dynamic(["claude.exe", "Claude","tritonserver", "tensorflow_model_server", "onnxruntime_server", "vllm", "text-generation-inference", "text-generation-server", "llama", "llama-server", "ollama", "torchserve", "oobabooga", "koboldcpp", "lmstudio"]);
+let LLMApiDomains = dynamic(["api.openai.com", "openai.azure.com", "api.anthropic.com", "claude.ai", "claude.com", "generativelanguage.googleapis.com", "aiplatform.googleapis.com", "api.mistral.ai", "api.perplexity.ai", "pplx-api.perplexity.ai", "api.cohere.ai", "api.x.ai", "llama.developer.meta.com", "api.deepseek.com", "dashscope.aliyuncs.com", "qwen-api.aliyuncs.com", "openrouter.ai", "api.together.xyz", "api.fireworks.ai", "api.groq.com","api-inference.huggingface.co","api.replicate.com","api.stability.ai","litellm"]);
+let KnownAIServingProcessNames = dynamic(["open-webui","litellm","fastchat","vicuna" ,"claude.exe", "Claude","tritonserver", "tensorflow_model_server", "onnxruntime_server", "vllm", "text-generation-inference", "text-generation-server", "llama", "llama-server", "ollama", "torchserve", "oobabooga", "koboldcpp", "lmstudio"]);
 let GenericInterpreterProcessNames = dynamic(["python", "python3", "python.exe", "node", "node.exe", "java", "dotnet", "dotnet.exe", "go", "uvicorn", "gunicorn"]);
 let AICmdlineKeywords = dynamic(["mcp_server", "mcp-server", "--mcp", "sse-server", "model-context-protocol","--model", "--models", "--model-path", "--model_dir", "model", "models", "text-generation-inference", "vllm", "llama.cpp", "tritonserver", "inference", "serve", "server", "llm", "embeddings"]);
 let AIModuleFileNamePatterns = dynamic(["torch_cpu", "torch_cuda", "tensorflow", "onnxruntime", "ggml", "llama", "nvinfer", "tensorrt", "cudart", "cublas", "cudnn"]);
-let AIModulePathPatterns = dynamic(["torch", "transformers", "tensorflow", "jax", "sentence_transformers", "huggingface", "llama", "gguf", "onnx", "checkpoints", "models"]);
+let AIModulePathPatterns = dynamic(["torch", "transformers", "tensorflow", "jax", "sentence_transformers", "huggingface", "llama", "gguf", "onnx", "checkpoints", "models","litellm","fastchat","vicuna" ]);
 let ModelFileExtensions = dynamic(["ckpt", "pt", "pth", "safetensors", "bin", "onnx", "pb", "meta", "gguf", "ggml", "gptq", "awq", "h5", "pkl", "model"]);
 let TokenizerAndConfigExtensions = dynamic(["json", "yaml", "yml", "tokenizer", "spm", "bpe", "vocab"]);
 let FileNameSearch = array_concat(KnownAIServingProcessNames, GenericInterpreterProcessNames, CommonDevOrBrowserProcesses, AIModuleFileNamePatterns);
@@ -430,7 +559,7 @@ let SuspiciousDirs = dynamic(["temp", "tmp", "downloads", "desktop", "documents"
 database("9327dadc-4486-45cc-919a-23953d952df4-e8240").table("{self.tenant_id}")
 | where OpTimeSecondsUTC between ({start_time} .. {end_time})
 | extend FileExtension = tolower(extract(@"\\.([^.]+)$", 1, FileName))
-|where tolower(ProcessName) !in (processIgnoreList)
+//|where tolower(ProcessName) !in (processIgnoreList)
 | where tolower(FileName) has_any (FileNameSearch) or tolower(FileDir) has_any (FileDirSearch) 
 or tolower(ProcessArgs) has_any (AICmdlineKeywords) 
 //or tolower(ParentProcessArgs) has_any (AICmdlineKeywords) 
@@ -1086,50 +1215,45 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                                 'key_found': False,
                                 'occurrence_count': 0
                         },
-                        'anomalies': [{
-                            'type': 'ALERT_NEW_AI_AGENT_NOT_IN_BASELINE',
-                            'severity': 'LOW',
-                            'details': f"AI agent not in baseline: {process} (user: {user}, signer: {signer})",
-                            
-                            # Process details
-                            'process_name': process,
-                            'process_dir': row.get('ProcessDir', 'UNKNOWN'),
-                            'process_args_full': str(row.get('ProcessArgs', ''))[:500],
-                            'normalized_args': norm_args[:200],
-                            
-                            # Identity details
-                            'user': user,
-                            'signer': signer,
-                            'machine': machine,
-                            
-                            # Behavior observed
-                            'ai_score': float(row.get('aiScore_avg', 0)) if pd.notna(row.get('aiScore_avg')) else 0,
-                            'event_count': int(row.get('event_count', 0)) if pd.notna(row.get('event_count')) else 0,
-                            'network_bytes_sent': int(row.get('NetworkBytesSent_sum', 0)) if pd.notna(row.get('NetworkBytesSent_sum')) else 0,
-                            'network_bytes_received': int(row.get('NetworkBytesReceived_sum', 0)) if pd.notna(row.get('NetworkBytesReceived_sum')) else 0,
-                            
-                            # Network activity
-                            'contacted_domains': current_domains,
-                            'contacted_ips': current_ips,
-                            'contacted_ports': current_ports,
-                            
-                            # File activity
-                            'accessed_directories_sample': current_dirs,
-                            'accessed_extensions': list(self._safe_parse_list(row.get('accessed_extensions')))[:10],
-                            
-                            # Model files
-                            'model_files_count': int(row.get('model_files_count', 0)) if pd.notna(row.get('model_files_count')) else 0,
-                            'modified_model_files': list(self._safe_parse_list(row.get('modified_model_files')))[:5],
-                            
-                            # LLM API usage
-                            'llm_api_count': int(row.get('llm_api_count', 0)) if pd.notna(row.get('llm_api_count')) else 0,
-                            'non_llm_count': int(row.get('non_llm_count', 0)) if pd.notna(row.get('non_llm_count')) else 0,
-                            
-                            # Context
-                            'why_detected_as_ai': 'Scored as AI agent but no baseline exists for this combination',
-                            'baseline_key_searched': f"{process} | {user[:30]} | {signer} | {norm_args[:50]}...",
-                            'total_baselines_available': len(baselines)
-                        }]
+                        'anomalies': [
+                                        self._make_anomaly(
+                                            type="ALERT_NEW_AI_AGENT_NOT_IN_BASELINE",
+                                            severity="LOW",
+                                            details=f"AI agent not in baseline: {process} (user: {user}, signer: {signer})",
+                                            row=row,
+                                            baseline=None,  # <-- no baseline exists for this path
+                                            normalized_args=norm_args,
+                                            occurrence_count=0,
+                                            baseline_context={
+                                                "searched_key": f"{machine} | {process} | {user} | {signer}",
+                                                "searched_normalized_args": norm_args[:100],
+                                                "key_found": False,
+                                                "occurrence_count": 0
+                                            },
+                                            extra={
+                                                # Keep your existing “max detail” fields (optional, but matches your current output)
+                                                "process_name": process,
+                                                "process_dir": row.get("ProcessDir", "UNKNOWN"),
+                                                "process_args_full": str(row.get("ProcessArgs", ""))[:500],
+                                                "normalized_args": norm_args[:200],
+
+                                                "ai_score": float(row.get("aiScore_avg", 0)) if pd.notna(row.get("aiScore_avg")) else 0,
+                                                "event_count": int(row.get("event_count", 0)) if pd.notna(row.get("event_count")) else 0,
+                                                "network_bytes_sent": int(row.get("NetworkBytesSent_sum", 0)) if pd.notna(row.get("NetworkBytesSent_sum")) else 0,
+                                                "network_bytes_received": int(row.get("NetworkBytesReceived_sum", 0)) if pd.notna(row.get("NetworkBytesReceived_sum")) else 0,
+
+                                                "contacted_domains": current_domains,
+                                                "contacted_ips": current_ips,
+                                                "contacted_ports": current_ports,
+                                                "accessed_directories_sample": current_dirs,
+                                                "accessed_extensions": list(self._safe_parse_list(row.get("accessed_extensions")))[:10],
+
+                                                "why_detected_as_ai": "Scored as AI agent but no baseline exists for this combination",
+                                                "baseline_key_searched": f"{process} | {user} | {signer} | ...",
+                                                "total_baselines_available": len(baselines),
+                                            }
+                                        )
+                                    ]
                     })
                     continue  # Skip to next process
                          
@@ -1165,15 +1289,29 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                                 'min_required': min_occurrences,
                                 'status': 'LEARNING'
                             },
-                            'anomalies': [{
-                                'type': 'ALERT_AI_AGENT_IN_LEARNING_PHASE',
-                                'severity': 'INFO',
-                                'details': f"Agent learning: {row['ProcessName']} seen {occurrence_count}/{min_occurrences} times",
-                                'process_name': row['ProcessName'],
-                                'user': user,
-                                'signer': signer,
-                                'days_until_active': min_occurrences - occurrence_count
-                            }]
+                            'anomalies': [
+                                self._make_anomaly(
+                                    type="ALERT_AI_AGENT_IN_LEARNING_PHASE",
+                                    severity="INFO",
+                                    details=f"Agent learning: {row['ProcessName']} seen {occurrence_count}/{min_occurrences} times",
+                                    row=row,
+                                    baseline=baseline,  # baseline exists here
+                                    normalized_args=normalized_args,
+                                    occurrence_count=occurrence_count,
+                                    baseline_context={
+                                        "searched_key": f"{row['MachineName']} | {row['ProcessName']} | {user} | {signer}",
+                                        "searched_normalized_args": normalized_args[:100],
+                                        "key_found": True,
+                                        "occurrence_count": occurrence_count,
+                                        "min_required": min_occurrences,
+                                        "status": "LEARNING"
+                                    },
+                                    extra={
+                                        "process_name": row["ProcessName"],
+                                        "days_until_active": min_occurrences - occurrence_count
+                                    }
+                                )
+                            ]
                         })
                     continue  # ← Skip anomaly detection for this agent
                 
@@ -1181,7 +1319,9 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                 if matched_keys <= min_occurrences:
                     print(f"  ✅ FOUND in baseline!")
                 
-                
+
+    
+
                 anomalies = []  # Collect ALL anomalies for this instance
                 
                 # Use actual event time, not now()
@@ -1194,15 +1334,25 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                 # ===== NEW: Check if user is in baseline =====
                 baseline_users = baseline.get('users', set())
                 if user not in baseline_users:
-                    anomalies.append({
-                        'type': 'ALERT_NEW_USER_FOR_PROCESS',
-                        'severity': 'HIGH',
-                        'details': f"Process {row['ProcessName']} run by NEW user: {user}",
-                        'current_user': user,
-                        'baseline_users': list(baseline_users)[:10],
-                        'process': row['ProcessName'],
-                        'process_args': str(row.get('ProcessArgs', ''))[:200]
-                    })
+                    anomalies.append(
+                        self._make_anomaly(
+                            type="ALERT_NEW_USER_FOR_PROCESS",
+                            severity="HIGH",
+                            details=f"Process {row['ProcessName']} run by NEW user: {user}",
+                            row=row,
+                            baseline=baseline,
+                            normalized_args=normalized_args,
+                            occurrence_count=occurrence_count,
+                            baseline_context={
+                                "status": "ACTIVE_DETECTION",
+                                "reason": "NEW_USER"
+                            },
+                            extra={
+                                "current_user": user,
+                                "baseline_users": list(baseline_users)[:10]
+                            }
+                        )
+                    )
     
                 
                 
@@ -1222,13 +1372,17 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                         truly_new_domains.append(domain)
                 
                 if truly_new_domains:
-                    anomalies.append({
-                        'type': 'ALERT_NEW_DOMAINS',
-                        'severity': 'HIGH',
-                        'details': f"Contacted {len(truly_new_domains)} genuinely new domain(s)",
-                        'new_domains': truly_new_domains,
-                        'baseline_domains': list(baseline_domains)[:10]
-                    })
+                    anomalies.append(self._make_anomaly(
+                        type="ALERT_NEW_DOMAINS",
+                        severity="HIGH",
+                        details=f"Contacted {len(truly_new_domains)} new domains",
+                        row=row,
+                        baseline=baseline,
+                        normalized_args=normalized_args,
+                        occurrence_count=occurrence_count,
+                        baseline_context={"status": "ACTIVE_DETECTION"},
+                        extra={"new_domains": truly_new_domains}
+                    ))
                 
                 # ===== Check NEW IPS (exact match - IPs don't have variations) =====
                 ips_raw = row.get('contacted_ips')
@@ -1237,13 +1391,27 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                 
                 new_ips = current_ips - baseline_ips
                 if new_ips:
-                    anomalies.append({
-                        'type': 'ALERT_NEW_IPS',
-                        'severity': 'HIGH',
-                        'details': f"Contacted {len(new_ips)} new IP(s)",
-                        'new_ips': list(new_ips),
-                        'baseline_ips': list(baseline_ips)[:10]
-                    })
+                    anomalies.append(
+                        self._make_anomaly(
+                            type="ALERT_NEW_IPS",
+                            severity="HIGH",
+                            details=f"Contacted {len(new_ips)} new IP(s)",
+                            row=row,
+                            baseline=baseline,
+                            normalized_args=normalized_args,
+                            occurrence_count=occurrence_count,
+                            baseline_context={
+                                "status": "ACTIVE_DETECTION",
+                                "reason": "NEW_IPS"
+                            },
+                            extra={
+                                "new_ips": list(new_ips),
+                                "baseline_ips_sample": list(baseline_ips)[:10]
+                            }
+                        )
+                    )
+                                        
+
                 
                 # ===== Check NEW PORTS (exact match) =====
                 ports_raw = row.get('contacted_ports')
@@ -1252,12 +1420,25 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                 
                 new_ports = current_ports - baseline_ports
                 if new_ports:
-                    anomalies.append({
-                        'type': 'ALERT_NEW_PORTS',
-                        'severity': 'MEDIUM',
-                        'details': f"Connected to {len(new_ports)} new port(s)",
-                        'new_ports': list(new_ports)
-                    })
+                    anomalies.append(
+                        self._make_anomaly(
+                            type="ALERT_NEW_PORTS",
+                            severity="MEDIUM",
+                            details=f"Connected to {len(new_ports)} new port(s)",
+                            row=row,
+                            baseline=baseline,
+                            normalized_args=normalized_args,
+                            occurrence_count=occurrence_count,
+                            baseline_context={
+                                "status": "ACTIVE_DETECTION",
+                                "reason": "NEW_PORTS"
+                            },
+                            extra={
+                                "new_ports": list(new_ports),
+                                "baseline_ports": list(baseline_ports)[:20]
+                            }
+                        )
+)
                 
                 # ===== Check NEW DIRECTORIES (with similarity) =====
                 dirs_raw = row.get('accessed_dirs')
@@ -1289,26 +1470,54 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                         truly_new_dirs.append(curr_dir)
                 
                 if truly_new_dirs:
-                    anomalies.append({
-                        'type': 'ALERT_NEW_DIRECTORIES',
-                        'severity': 'MEDIUM',
-                        'details': f"Accessed {len(truly_new_dirs)} genuinely new directory(ies)",
-                        'new_directories': truly_new_dirs[:20],
-                        'sample_baseline_dirs': list(baseline_dirs)[:10]
-                    })
+                    anomalies.append(
+                        self._make_anomaly(
+                            type="ALERT_NEW_DIRECTORIES",
+                            severity="MEDIUM",
+                            details=f"Accessed {len(truly_new_dirs)} genuinely new directory(ies)",
+                            row=row,
+                            baseline=baseline,
+                            normalized_args=normalized_args,
+                            occurrence_count=occurrence_count,
+                            baseline_context={
+                                "status": "ACTIVE_DETECTION",
+                                "reason": "NEW_DIRECTORIES"
+                            },
+                            extra={
+                                "new_directories": truly_new_dirs[:20],
+                                "baseline_directories_sample": list(baseline_dirs)[:10]
+                            }
+                        )
+)
                 
                 
                 
                 # ===== Check EXCESSIVE TRANSFER =====
                 avg_sent = baseline['stats'].get('avg_bytes_sent', 0)
                 if avg_sent > 0 and row['NetworkBytesSent_sum'] > avg_sent * 10:
-                    anomalies.append({
-                        'type': 'ALERT_EXCESSIVE_TRANSFER',
-                        'severity': 'CRITICAL',
-                        'details': f"Sent {row['NetworkBytesSent_sum']/1e6:.1f}MB vs avg {avg_sent/1e6:.1f}MB",
-                        'bytes_sent': int(row['NetworkBytesSent_sum']),
-                        'baseline_avg': int(avg_sent)
-                    })
+                    anomalies.append(
+                        self._make_anomaly(
+                            type="ALERT_EXCESSIVE_TRANSFER",
+                            severity="CRITICAL",
+                            details=(
+                                f"Sent {row['NetworkBytesSent_sum']/1e6:.1f}MB "
+                                f"vs avg {avg_sent/1e6:.1f}MB"
+                            ),
+                            row=row,
+                            baseline=baseline,
+                            normalized_args=normalized_args,
+                            occurrence_count=occurrence_count,
+                            baseline_context={
+                                "status": "ACTIVE_DETECTION",
+                                "reason": "EXCESSIVE_TRANSFER"
+                            },
+                            extra={
+                                # Explicit values for analyst clarity
+                                "bytes_sent": int(row.get("NetworkBytesSent_sum", 0)),
+                                "baseline_avg_bytes_sent": int(avg_sent)
+                            }
+                        )
+                    )
                     
                 # ===== Check NEW FILE EXTENSIONS =====
                 exts_raw = row.get('accessed_extensions')
@@ -1321,13 +1530,25 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                 suspicious_exts = new_exts - COMMON_EXTS
 
                 if suspicious_exts:
-                    anomalies.append({
-                        'type': 'ALERT_NEW_FILE_EXTENSIONS',
-                        'severity': 'MEDIUM',
-                        'details': f"Accessed {len(suspicious_exts)} new file extension(s)",
-                        'new_extensions': list(suspicious_exts),
-                        'baseline_extensions': list(baseline_exts)[:20]
-                    })
+                    anomalies.append(
+                        self._make_anomaly(
+                            type="ALERT_NEW_FILE_EXTENSIONS",
+                            severity="MEDIUM",
+                            details=f"Accessed {len(suspicious_exts)} new file extension(s)",
+                            row=row,
+                            baseline=baseline,
+                            normalized_args=normalized_args,
+                            occurrence_count=occurrence_count,
+                            baseline_context={
+                                "status": "ACTIVE_DETECTION",
+                                "reason": "NEW_FILE_EXTENSIONS"
+                            },
+                            extra={
+                                "new_extensions": list(suspicious_exts),
+                                "baseline_extensions": list(baseline_exts)[:20]
+                            }
+                        )
+                    )
 
                 # ===== Check NEW FILES ACCESSED (with normalization and similarity) =====
                 files_raw = row.get('accessed_files')
@@ -1347,14 +1568,25 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
 
                 # Only alert if accessing many new files (could be normal for some apps)
                 if len(truly_new_files) > 5:
-                    anomalies.append({
-                        'type': 'ALERT_ACCESSING_MANY_NEW_FILES',
-                        'severity': 'MEDIUM',
-                        'details': f"Accessed {len(truly_new_files)} new files",
-                        'new_files_sample': truly_new_files[:20],
-                        'baseline_files_sample': list(baseline_files)[:20]
-                    })
-
+                    anomalies.append(
+                        self._make_anomaly(
+                            type="ALERT_ACCESSING_MANY_NEW_FILES",
+                            severity="MEDIUM",
+                            details=f"Accessed {len(truly_new_files)} new files",
+                            row=row,
+                            baseline=baseline,
+                            normalized_args=normalized_args,
+                            occurrence_count=occurrence_count,
+                            baseline_context={
+                                "status": "ACTIVE_DETECTION",
+                                "reason": "MANY_NEW_FILES"
+                            },
+                            extra={
+                                "new_files_sample": truly_new_files[:20],
+                                "baseline_files_sample": list(baseline_files)[:20]
+                            }
+                        )
+                    )
 
 
 
@@ -1395,26 +1627,46 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                         # File NEVER modified before
                         domains = row.get('contacted_domains')
                         ips = row.get('contacted_ips')
-                        anomalies.append({
-                            'type': 'ALERT_NEW_MODEL_FILE_MODIFICATION',
-                            'severity': 'CRITICAL',
-                            'details': f"FIRST TIME MODIFICATION: Model file {original_file} has never been modified before",
-                            'file': original_file,
-                            'normalized_file': norm_file,
-                            'file_type': original_file.split('.')[-1] if '.' in original_file else 'unknown',
-                            'modifying_user': mod_user,
-                            'modifying_process': row['ProcessName'],
-                            'modifying_process_args': str(row.get('ProcessArgs', ''))[:500],
-                            'modifying_pid': int(row['Pid']) if pd.notna(row['Pid']) else None,
-                            'contacted_domains': (
-                                list(ast.literal_eval(domains))[:10]
-                                if isinstance(domains, str)
-                                else list(domains)[:10] if isinstance(domains, (list, tuple))
-                                else []),
-                            'network_bytes_sent': int(row.get('NetworkBytesSent_sum', 0)),
-                            'all_baseline_model_files_ever_modified': list(baseline_file_ops.keys())[:20],
-                            'baseline_normal_users': list(baseline.get('users', set()))[:10]
-                        })
+                        anomalies.append(
+                            self._make_anomaly(
+                                type="ALERT_NEW_MODEL_FILE_MODIFICATION",
+                                severity="CRITICAL",
+                                details=f"FIRST TIME MODIFICATION: Model file {original_file} has never been modified before",
+                                row=row,
+                                baseline=baseline,
+                                normalized_args=normalized_args,
+                                occurrence_count=occurrence_count,
+                                baseline_context={
+                                    "status": "ACTIVE_DETECTION",
+                                    "reason": "FIRST_MODEL_MODIFICATION"
+                                },
+                                extra={
+                                    # File identity
+                                    "file": original_file,
+                                    "normalized_file": norm_file,
+                                    "file_type": original_file.split('.')[-1] if '.' in original_file else "unknown",
+
+                                    # Modification context
+                                    "modifying_user": mod_user,
+                                    "modifying_process": row["ProcessName"],
+                                    "modifying_process_args": str(row.get("ProcessArgs", ""))[:500],
+                                    "modifying_pid": int(row["Pid"]) if pd.notna(row["Pid"]) else None,
+
+                                    # Network context (explicitly kept)
+                                    "contacted_domains": (
+                                        list(ast.literal_eval(domains))[:10]
+                                        if isinstance(domains, str)
+                                        else list(domains)[:10] if isinstance(domains, (list, tuple))
+                                        else []
+                                    ),
+                                    "network_bytes_sent": int(row.get("NetworkBytesSent_sum", 0)),
+
+                                    # Baseline reference
+                                    "all_baseline_model_files_ever_modified": list(baseline_file_ops.keys())[:20],
+                                    "baseline_normal_users": list(baseline.get("users", set()))[:10]
+                                }
+                            )
+                        )
                     else:
                         # File was modified before - check if by NEW USER or with UNUSUAL ARGS
                         file_baseline = baseline_file_ops[matching_baseline_file]
@@ -1425,19 +1677,43 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                             baseline_users = baseline.get('users', set())
                             severity = 'CRITICAL' if mod_user not in baseline_users else 'MEDIUM'
                             
-                            anomalies.append({
-                                'type': 'ALERT_MODEL_FILE_MODIFIED_BY_NEW_USER',
-                                'severity': severity,
-                                'details': f"Model file {original_file} modified by {'UNAUTHORIZED' if severity == 'CRITICAL' else 'unusual'} user {mod_user}",
-                                'file': original_file,
-                                'normalized_file': norm_file,
-                                'current_user': mod_user,
-                                'current_process': row['ProcessName'],
-                                'baseline_authorized_users_for_file': list(file_baseline.get('users', set())),
-                                'baseline_all_users_for_process': list(baseline_users)[:10],
-                                'network_bytes_sent': int(row.get('NetworkBytesSent_sum', 0))
-                            })
-                        
+                            anomalies.append(
+                                self._make_anomaly(
+                                    type="ALERT_MODEL_FILE_MODIFIED_BY_NEW_USER",
+                                    severity=severity,
+                                    details=(
+                                        f"Model file {original_file} modified by "
+                                        f"{'UNAUTHORIZED' if severity == 'CRITICAL' else 'unusual'} user {mod_user}"
+                                    ),
+                                    row=row,
+                                    baseline=baseline,
+                                    normalized_args=normalized_args,
+                                    occurrence_count=occurrence_count,
+                                    baseline_context={
+                                        "status": "ACTIVE_DETECTION",
+                                        "reason": "MODEL_MODIFIED_BY_NEW_USER",
+                                        "file_user_authorization": (
+                                            "UNAUTHORIZED" if severity == "CRITICAL" else "UNUSUAL"
+                                        )
+                                    },
+                                    extra={
+                                        # File identity
+                                        "file": original_file,
+                                        "normalized_file": norm_file,
+
+                                        # Actor / process details (kept exactly as you had)
+                                        "current_user": mod_user,
+                                        "current_process": row["ProcessName"],
+
+                                        # Baseline context you wanted surfaced
+                                        "baseline_authorized_users_for_file": list(file_baseline.get("users", set())),
+                                        "baseline_all_users_for_process": list(baseline_users)[:10],
+
+                                        # Network context you explicitly included
+                                        "network_bytes_sent": int(row.get("NetworkBytesSent_sum", 0)),
+                                    }
+                                )
+                            )
                         # Check ARGS similarity
                         if mod_args:
                             baseline_args = file_baseline.get('process_args', set())
@@ -1453,18 +1729,40 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                                 
                                 # Lower threshold to 0.5 to reduce false positives
                                 if max_sim < 0.5:
-                                    anomalies.append({
-                                        'type': 'ALERT_MODEL_FILE_MODIFIED_WITH_UNUSUAL_ARGS',
-                                        'severity': 'HIGH',
-                                        'details': f"Model file {original_file} modified with unusual arguments (similarity: {max_sim:.2f})",
-                                        'file': original_file,
-                                        'normalized_file': norm_file,
-                                        'current_args': str(mod_args)[:500],
-                                        'similarity_to_best_baseline': f"{max_sim:.2f}",
-                                        'best_matching_baseline_arg': str(best_match)[:200] if best_match else None,
-                                        'modifying_user': mod_user,
-                                        'modifying_process': row['ProcessName']
-                                    })
+                                    anomalies.append(
+                                        self._make_anomaly(
+                                            type="ALERT_MODEL_FILE_MODIFIED_WITH_UNUSUAL_ARGS",
+                                            severity="HIGH",
+                                            details=(
+                                                f"Model file {original_file} modified with unusual arguments "
+                                                f"(similarity: {max_sim:.2f})"
+                                            ),
+                                            row=row,
+                                            baseline=baseline,
+                                            normalized_args=normalized_args,
+                                            occurrence_count=occurrence_count,
+                                            baseline_context={
+                                                "status": "ACTIVE_DETECTION",
+                                                "reason": "UNUSUAL_MODEL_ARGS"
+                                            },
+                                            extra={
+                                                # File identity
+                                                "file": original_file,
+                                                "normalized_file": norm_file,
+
+                                                # Argument analysis
+                                                "current_args": str(mod_args)[:500],
+                                                "similarity_to_best_baseline": f"{max_sim:.2f}",
+                                                "best_matching_baseline_arg": (
+                                                    str(best_match)[:200] if best_match else None
+                                                ),
+
+                                                # Actor context
+                                                "modifying_user": mod_user,
+                                                "modifying_process": row["ProcessName"]
+                                            }
+                                        )
+                                    )
 
                     # ===== Check CHILD SPAWNING =====
                     children_of_this = df_children[
@@ -1490,16 +1788,27 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                         if not exact_match:
                             # No exact match - check similarity with baseline args for this process
                             baseline_args_for_proc = [args for proc, args in baseline_spawned if proc == child_process]
-                            
+                                
                             if not baseline_args_for_proc:
-                                # Process never spawned before at all
-                                anomalies.append({
-                                    'type': 'ALERT_NEW_SPAWNED_PROCESS',
-                                    'severity': 'CRITICAL',
-                                    'details': f"Never spawned: {child_process}",
-                                    'child_process': child_process,
-                                    'child_args': str(child_args)[:200] if child_args else ""
-                                })
+                                anomalies.append(
+                                    self._make_anomaly(
+                                        type="ALERT_NEW_SPAWNED_PROCESS",
+                                        severity="CRITICAL",
+                                        details=f"Never spawned: {child_process}",
+                                        row=row,                 # parent process row
+                                        baseline=baseline,
+                                        normalized_args=normalized_args,
+                                        occurrence_count=occurrence_count,
+                                        baseline_context={
+                                            "status": "ACTIVE_DETECTION",
+                                            "reason": "NEW_SPAWNED_PROCESS"
+                                        },
+                                        extra={
+                                            "child_process": child_process,
+                                            "child_args": str(child_args)[:200] if child_args else ""
+                                        }
+                                    )
+                                )
                             else:
                                 # Process was spawned before - check arg similarity
                                 max_similarity = 0
@@ -1509,16 +1818,39 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                                 
                                 # Only alert if args are very different (threshold 0.7)
                                 if max_similarity < 0.7:
-                                    anomalies.append({
-                                        'type': 'SALERT_PAWNED_PROCESS_UNUSUAL_ARGS',
-                                        'severity': 'HIGH',
-                                        'details': f"Spawned {child_process} with unusual arguments (similarity: {max_similarity:.2f})",
-                                        'child_process': child_process,
-                                        'child_normalized_args': child_args_norm,
-                                        'child_actual_args': str(child_args)[:200] if child_args else "",
-                                        'similarity_score': f"{max_similarity:.2f}",
-                                        'most_similar_baseline': str(baseline_args_for_proc[0])[:100] if baseline_args_for_proc else ""
-                                    })
+                                    anomalies.append(
+                                        self._make_anomaly(
+                                            type="SALERT_SPAWNED_PROCESS_UNUSUAL_ARGS",
+                                            severity="HIGH",
+                                            details=(
+                                                f"Spawned {child_process} with unusual arguments "
+                                                f"(similarity: {max_similarity:.2f})"
+                                            ),
+                                            row=row,                       # parent process row
+                                            baseline=baseline,
+                                            normalized_args=normalized_args,
+                                            occurrence_count=occurrence_count,
+                                            baseline_context={
+                                                "status": "ACTIVE_DETECTION",
+                                                "reason": "SPAWNED_PROCESS_UNUSUAL_ARGS"
+                                            },
+                                            extra={
+                                                # Child process details
+                                                "child_process": child_process,
+                                                "child_normalized_args": child_args_norm,
+                                                "child_actual_args": (
+                                                    str(child_args)[:200] if child_args else ""
+                                                ),
+
+                                                # Similarity analysis
+                                                "similarity_score": f"{max_similarity:.2f}",
+                                                "most_similar_baseline": (
+                                                    str(baseline_args_for_proc[0])[:100]
+                                                    if baseline_args_for_proc else ""
+                                                )
+                                            }
+                                        )
+                                    )
 
                     # ONE alert per process instance with ALL anomalies
                     if anomalies:
@@ -1605,8 +1937,20 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                     'severity': anomaly.get('severity', 'UNKNOWN'),
                     'anomaly_type': anomaly.get('type', 'UNKNOWN'),
                     'details': anomaly.get('details', ''),
+                    'mitre_attack': ",".join(anomaly.get("mitre_attack", [])),
+                    'ai_risk': ",".join(anomaly.get("ai_risk", [])),
+                    'confidence': anomaly.get("confidence", "Unknown"),
+                        # Rich payloads for SOC/IR
+                    'observed_json': self._to_json_str(anomaly.get("observed", {})),
+                    'baseline_snapshot_json': self._to_json_str(anomaly.get("baseline_snapshot", {})),
+                    'children_sample_json': self._to_json_str(anomaly.get("children_sample", [])),
+                    'baseline_context_json': self._to_json_str(anomaly.get("baseline_context", {})),
+
+                    # Full anomaly record (best for SOAR/IR rehydration)
+                    'anomaly_json': self._to_json_str(anomaly),
                     }
                 
+                flat_alert["alert_id"] = self._alert_id(alert, anomaly)
                 # Add all other anomaly fields as JSON
                 extra_fields = {}
                 for k, v in anomaly.items():
@@ -1898,7 +2242,7 @@ def execute(cluster, database, tenant, output_dir, mode, lookback_unit='day',
     detector = AIAgentAnomalyDetector(cluster, database, tenant, output_dir)
     
     print("="*80)
-    print(f"🤖 AI Agent Anomaly 8 Detection for {tenant}")
+    print(f"🤖 AI Agent Anomaly 9 Detection for {tenant}")
     print("="*80)
     
     if mode == 'bootstrap':
