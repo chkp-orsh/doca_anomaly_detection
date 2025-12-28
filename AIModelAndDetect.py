@@ -15,6 +15,26 @@ import random
 import ast
 import hashlib
 
+import ai_anomaly_defs
+from ai_anomaly_defs import REGEX_PATTERNS
+from ai_anomaly_defs import (
+    ALERT_CLASSIFICATION, ALERT_RUNBOOKS,
+    MODEL_FILE_EXTENSIONS, TOKENIZER_AND_CONFIG_EXTENSIONS,
+    SUSPICIOUS_CMDLINE_KEYWORDS,
+    KNOWN_AI_SERVING_PROCESS_NAMES, GENERIC_INTERPRETER_PROCESS_NAMES,
+    REGEX_PATTERNS, MODEL_PATH_PATTERNS,
+    SEVERITY_THRESHOLDS,
+)
+
+from ai_anomaly_defs import (
+    TOOL_PROCESS_NAMES, COMMON_DEV_OR_BROWSER_PROCESSES, LOCALHOST_ADDRESSES,
+    COMMON_AI_SERVING_PORTS, LLM_API_PATH_FRAGMENTS, LLM_API_DOMAINS,
+    KNOWN_AI_SERVING_PROCESS_NAMES, GENERIC_INTERPRETER_PROCESS_NAMES,
+    AI_CMDLINE_KEYWORDS, AI_MODULE_FILENAME_PATTERNS, AI_MODULE_PATH_PATTERNS,
+    MODEL_FILE_EXTENSIONS, TOKENIZER_AND_CONFIG_EXTENSIONS
+)
+
+
 
 #set servertimeout = 10m;
 #set query_results_cache_max_age = 0d;
@@ -24,89 +44,6 @@ import ast
 
 def clean_set(domains):
     return {str(d).strip() for d in domains if d is not None and str(d).strip()}
-    
-
-# ============================================================
-# MITRE ATT&CK + AI Risk Taxonomy Mapping
-# ============================================================
-
-ALERT_CLASSIFICATION = {
-    "ALERT_NEW_AI_AGENT_NOT_IN_BASELINE": {
-        "mitre": ["T1059"],
-        "ai_risk": ["Shadow AI", "Unauthorized AI Deployment"],
-        "confidence": "Medium"
-    },
-    "ALERT_NEW_USER_FOR_PROCESS": {
-        "mitre": ["T1078"],
-        "ai_risk": ["Unauthorized AI Usage", "Privilege Abuse"],
-        "confidence": "High"
-    },
-    "ALERT_NEW_DOMAINS": {
-        "mitre": ["T1071.001"],
-        "ai_risk": ["Data Exfiltration", "Unapproved AI Provider"],
-        "confidence": "High"
-    },
-    "ALERT_NEW_IPS": {
-        "mitre": ["T1071"],
-        "ai_risk": ["Data Exfiltration"],
-        "confidence": "High"
-    },
-    "ALERT_NEW_PORTS": {
-        "mitre": ["T1046"],
-        "ai_risk": ["Unapproved Service Exposure", "Suspicious Connectivity"],
-        "confidence": "Medium"
-    },
-    "ALERT_EXCESSIVE_TRANSFER": {
-        "mitre": ["T1041"],
-        "ai_risk": ["Sensitive Data Leakage"],
-        "confidence": "Critical"
-    },
-    "ALERT_NEW_DIRECTORIES": {
-        "mitre": ["T1083"],
-        "ai_risk": ["Sensitive Data Discovery"],
-        "confidence": "Medium"
-    },
-    "ALERT_NEW_FILE_EXTENSIONS": {
-        "mitre": ["T1005"],
-        "ai_risk": ["Sensitive Data Access"],
-        "confidence": "Medium"
-    },
-    "ALERT_ACCESSING_MANY_NEW_FILES": {
-        "mitre": ["T1005"],
-        "ai_risk": ["Bulk Data Access"],
-        "confidence": "Medium"
-    },
-    "ALERT_NEW_MODEL_FILE_MODIFICATION": {
-        "mitre": ["T1565.001"],
-        "ai_risk": ["Model Poisoning", "Model Integrity Violation"],
-        "confidence": "Critical"
-    },
-    "ALERT_MODEL_FILE_MODIFIED_BY_NEW_USER": {
-        "mitre": ["T1078", "T1565.001"],
-        "ai_risk": ["Unauthorized Model Access", "Model Poisoning"],
-        "confidence": "Critical"
-    },
-    "ALERT_MODEL_FILE_MODIFIED_WITH_UNUSUAL_ARGS": {
-        "mitre": ["T1059", "T1565.001"],
-        "ai_risk": ["Model Tampering", "Model Backdooring"],
-        "confidence": "High"
-    },
-    "ALERT_NEW_SPAWNED_PROCESS": {
-        "mitre": ["T1106", "T1059"],
-        "ai_risk": ["AI Agent Abuse", "Post-Exploitation"],
-        "confidence": "High"
-    },
-    "SALERT_SPAWNED_PROCESS_UNUSUAL_ARGS": {
-        "mitre": ["T1059"],
-        "ai_risk": ["Living-off-the-Land via AI"],
-        "confidence": "High"
-    },
-    "ALERT_AI_AGENT_IN_LEARNING_PHASE": {
-        "mitre": [],
-        "ai_risk": ["Baseline Learning"],
-        "confidence": "Low"
-    }
-}
 
 
 
@@ -131,6 +68,8 @@ class AIAgentAnomalyDetector:
         
         self.kcsb = KustoConnectionStringBuilder.with_az_cli_authentication(cluster_url)
         self.client = KustoClient(self.kcsb)
+
+
         
     def _to_json_str(self, v, max_len: int = 20000) -> str:
         """Safe stringify for CSV: list/dict/set -> compact JSON; truncate."""
@@ -237,13 +176,24 @@ class AIAgentAnomalyDetector:
 
     def _deobfuscate_user_name(self, user):
         return self._deobfuscate_value(user)
-    
+        
     def _enrich_anomaly(self, anomaly):
-        classification = ALERT_CLASSIFICATION.get(anomaly.get("type"), {})
+        alert_type = anomaly.get("type")
+
+        classification = ai_anomaly_defs.ALERT_CLASSIFICATION.get(alert_type, {})
         anomaly["mitre_attack"] = classification.get("mitre", [])
         anomaly["ai_risk"] = classification.get("ai_risk", [])
         anomaly["confidence"] = classification.get("confidence", "Unknown")
-        return anomaly 
+
+        anomaly["soc_runbook"] = ai_anomaly_defs.ALERT_RUNBOOKS.get(alert_type, {
+            "summary": "No runbook defined.",
+            "triage": [],
+            "investigation": [],
+            "response": []
+        })
+
+        return anomaly
+
         
     def _make_anomaly(
         self,
@@ -317,6 +267,15 @@ class AIAgentAnomalyDetector:
 
         # Optional: caller extras
         anomaly.update(extra)
+        
+        model_path_hits = []
+        for d in anomaly["observed"].get("accessed_dirs", []):
+            if any(p.search(d) for p in MODEL_PATH_PATTERNS):
+                model_path_hits.append(d)
+                if len(model_path_hits) >= 10:
+                    break
+
+        anomaly["observed"]["model_path_hits"] = model_path_hits
 
         # 🔐 ALWAYS enrich here
         return self._enrich_anomaly(anomaly)
@@ -355,7 +314,7 @@ class AIAgentAnomalyDetector:
     
     
         
-    def _execute_query(self, query, max_tries=3, sleepTimeinSecs=30):
+    def _execute_query(self, query, max_tries=5, sleepTimeinSecs=30):
         trys=0
         
         #print ("=============")
@@ -377,14 +336,14 @@ class AIAgentAnomalyDetector:
                 str_error = str(e).lower()
                 
                 #look if it is a DB error, they are usually temporary, so wait some time and try again
-                substrings =["Failed to resolve table expression","Access denied","Failed to obtain Az","Az login"]
+                substrings =["Failed to resolve table expression","Access denied","Failed to obtain Az","Az login", "access", "connection", "network"]
     
                 print(f"❌ Query error: 1 {e}")
                 if any(sub.lower() in str_error for sub in substrings):
                 #str_conn_err in str_error:
-                    print ("eeeeeeeeeeeeeeeeeeeee traying again")
+                    print (f"eeeeeeeeeeeeeeeeeeeee traying again {trys}")
                     time.sleep (sleepTimeinSecs)
-                    print (f"eeeeeeeeeeeeeeeeeeeee After Sleep {sleepTimeinSecs}")
+                    print (f"eeeeeeeeeeeeeeeeeeeee {trys} After Sleep {sleepTimeinSecs}")
                     pass
                 else:    
                     print(f"❌ Query error: 2 {e}")
@@ -400,6 +359,11 @@ class AIAgentAnomalyDetector:
         
         import re
         args = str(args)
+        
+        args = REGEX_PATTERNS["guid"].sub("<GUID>", args)
+        args = REGEX_PATTERNS["sha256"].sub("<SHA256>", args)
+        args = REGEX_PATTERNS["sha1"].sub("<SHA1>", args)
+        args = REGEX_PATTERNS["md5"].sub("<MD5>", args)
         
         # Remove large numbers (>1000) - these are sizes, IDs, memory values
         args = re.sub(r'\b\d{4,}\b', '<NUM>', args)
@@ -437,6 +401,7 @@ class AIAgentAnomalyDetector:
         path = str(path).lower()
         
         # NEW: Normalize Windows volume numbers - they change between boots
+        path = REGEX_PATTERNS["user_profile"].sub(r"\\users\\<USER>\\", path)
         path = re.sub(r'\\device\\harddiskvolume\d+', r'\\device\\harddiskvolume<VOL>', path)
     
         
@@ -530,32 +495,41 @@ class AIAgentAnomalyDetector:
             else:
                 start_time = f"startofday(ago({lookback_value}d))"
                 end_time = f"endofday(ago({lookback_value}d))"
-        
+                
+        def _kusto_dynamic_str_list(items):
+            # -> dynamic(["a","b"])
+            escaped = [str(x).replace('\\', '\\\\').replace('"', '\\"') for x in items]
+            return 'dynamic(["' + '","'.join(escaped) + '"])'
+
+        def _kusto_dynamic_num_list(items):
+            # -> dynamic([1,2,3])
+            return "dynamic([" + ",".join(str(int(x)) for x in items) + "])"
+                
         print(f"\n📊 Query 1: AI process behavior from {lookback_value} {lookback_unit}(s) ago... on tenant {self.tenant_id}")
-        
+                
         query = f"""set servertimeout = 10m;
 set query_results_cache_max_age = 0d;
 set maxmemoryconsumptionperiterator=16106127360;
 let longNetworkCon=15m;let InterestingProcessRunTime=15m;
 let processIgnoreList=dynamic(["setup.exe","ms-teams.exe"]);
-let ToolProcessNames = dynamic(["cmd.exe", "powershell.exe", "pwsh.exe", "bash", "sh", "zsh", "curl.exe", "curl", "wget", "python.exe", "python", "python3", "node.exe", "node", "sqlcmd", "psql", "mysql", "scp", "sftp", "ssh", "kubectl", "helm", "az", "aws", "gcloud"]);
-let CommonDevOrBrowserProcesses = dynamic(["chrome.exe", "msedge.exe", "firefox.exe", "code", "code.exe", "idea64.exe", "pycharm64.exe", "explorer.exe"]);
-let LocalhostAddresses = dynamic(["127.0.0.1", "::1"]);
-let CommonAIServingPorts = dynamic([11434, 7860, 5000, 5001, 8000, 8001, 8080, 8888, 8889,443, 9000, 9001,3000]);
-let LLMApiPathFragments = dynamic(["/sse", "/mcp/v1", "/events" ,"/v1/chat/completions", "/openai/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/v1/images", "/v1/audio/transcriptions", "/responses", "/v1beta/models", ":generatecontent", "/dashscope/", "/chat/completions"]);
-let LLMApiDomains = dynamic(["api.openai.com", "openai.azure.com", "api.anthropic.com", "claude.ai", "claude.com", "generativelanguage.googleapis.com", "aiplatform.googleapis.com", "api.mistral.ai", "api.perplexity.ai", "pplx-api.perplexity.ai", "api.cohere.ai", "api.x.ai", "llama.developer.meta.com", "api.deepseek.com", "dashscope.aliyuncs.com", "qwen-api.aliyuncs.com", "openrouter.ai", "api.together.xyz", "api.fireworks.ai", "api.groq.com","api-inference.huggingface.co","api.replicate.com","api.stability.ai","litellm"]);
-let KnownAIServingProcessNames = dynamic(["open-webui","litellm","fastchat","vicuna" ,"claude.exe", "Claude","tritonserver", "tensorflow_model_server", "onnxruntime_server", "vllm", "text-generation-inference", "text-generation-server", "llama", "llama-server", "ollama", "torchserve", "oobabooga", "koboldcpp", "lmstudio"]);
-let GenericInterpreterProcessNames = dynamic(["python", "python3", "python.exe", "node", "node.exe", "java", "dotnet", "dotnet.exe", "go", "uvicorn", "gunicorn"]);
-let AICmdlineKeywords = dynamic(["mcp_server", "mcp-server", "--mcp", "sse-server", "model-context-protocol","--model", "--models", "--model-path", "--model_dir", "model", "models", "text-generation-inference", "vllm", "llama.cpp", "tritonserver", "inference", "serve", "server", "llm", "embeddings"]);
-let AIModuleFileNamePatterns = dynamic(["torch_cpu", "torch_cuda", "tensorflow", "onnxruntime", "ggml", "llama", "nvinfer", "tensorrt", "cudart", "cublas", "cudnn"]);
-let AIModulePathPatterns = dynamic(["torch", "transformers", "tensorflow", "jax", "sentence_transformers", "huggingface", "llama", "gguf", "onnx", "checkpoints", "models","litellm","fastchat","vicuna" ]);
-let ModelFileExtensions = dynamic(["ckpt", "pt", "pth", "safetensors", "bin", "onnx", "pb", "meta", "gguf", "ggml", "gptq", "awq", "h5", "pkl", "model"]);
-let TokenizerAndConfigExtensions = dynamic(["json", "yaml", "yml", "tokenizer", "spm", "bpe", "vocab"]);
+let ToolProcessNames = {_kusto_dynamic_str_list(TOOL_PROCESS_NAMES)};
+let CommonDevOrBrowserProcesses = {_kusto_dynamic_str_list(COMMON_DEV_OR_BROWSER_PROCESSES)};
+let LocalhostAddresses = {_kusto_dynamic_str_list(LOCALHOST_ADDRESSES)};
+let CommonAIServingPorts = {_kusto_dynamic_num_list(COMMON_AI_SERVING_PORTS)};
+let LLMApiPathFragments = {_kusto_dynamic_str_list(LLM_API_PATH_FRAGMENTS)};
+let LLMApiDomains = {_kusto_dynamic_str_list(LLM_API_DOMAINS)};
+let KnownAIServingProcessNames = {_kusto_dynamic_str_list(KNOWN_AI_SERVING_PROCESS_NAMES)};
+let GenericInterpreterProcessNames = {_kusto_dynamic_str_list(GENERIC_INTERPRETER_PROCESS_NAMES)};
+let AICmdlineKeywords = {_kusto_dynamic_str_list(AI_CMDLINE_KEYWORDS)};
+let AIModuleFileNamePatterns = {_kusto_dynamic_str_list(AI_MODULE_FILENAME_PATTERNS)};
+let AIModulePathPatterns = {_kusto_dynamic_str_list(AI_MODULE_PATH_PATTERNS)};
+let ModelFileExtensions = {_kusto_dynamic_str_list(MODEL_FILE_EXTENSIONS)};
+let TokenizerAndConfigExtensions = {_kusto_dynamic_str_list(TOKENIZER_AND_CONFIG_EXTENSIONS)};
 let FileNameSearch = array_concat(KnownAIServingProcessNames, GenericInterpreterProcessNames, CommonDevOrBrowserProcesses, AIModuleFileNamePatterns);
 let FileDirSearch = array_concat(LLMApiPathFragments, AIModulePathPatterns);
 let ExtSearch = array_concat(ModelFileExtensions, TokenizerAndConfigExtensions);
 let SuspiciousArgs = dynamic(["copy", "move", "xcopy", "robocopy", "scp", "curl", "wget", "invoke-webrequest", "download", "upload", "exfil", "compress", "zip", "7z"]);
-let SuspiciousDirs = dynamic(["temp", "tmp", "downloads", "desktop", "documents", "users"]);
+let SuspiciousDirs = dynamic(["temp", "tmp", "downloads", "desktop", "documents", "userlet ToolProcessNames s"]);
 database("9327dadc-4486-45cc-919a-23953d952df4-e8240").table("{self.tenant_id}")
 | where OpTimeSecondsUTC between ({start_time} .. {end_time})
 | extend FileExtension = tolower(extract(@"\\.([^.]+)$", 1, FileName))
@@ -597,7 +571,7 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
  ),
  isLargeFile = toint(FileSize > 100000)
 | extend aiScore = 5 * hasModelFile + 3 * hasTokenizerOrConfig + 4 * (hasAiRuntimeFile + hasAiRuntimePath) + 3 * isKnownAIServingProcess + 2 * hasAiCmdline + 2 * talksToLLMApi + 1 * usesAIServingPort + 1 * hasLocalhostInbound + 2 * hasLongConnection
-| where aiScore > 7
+| where aiScore > {SEVERITY_THRESHOLDS["min_ai_score"]}
 | summarize event_count = count(),
             PidCreationTime = take_any(PidCreationTime),
             NetworkBytesSent_sum = sum(NetworkBytesSent),
@@ -1170,6 +1144,70 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                     print(f"  user={user[:50]}")
                     print(f"  signer={signer}")
                 
+                # --- NEW: detect signer change for same machine+process+args ---
+                same_triplet_signers = [
+                    k[3] for k in baselines.keys()
+                    if k[0] == row['MachineName']
+                    and k[1] == row['ProcessName']
+                    and k[2] == normalized_args
+                ]
+
+                if same_triplet_signers and signer not in same_triplet_signers:
+                    # Choose severity policy
+                    severity = SEVERITY_THRESHOLDS["signer_changed_default"]
+                    if signer.upper() in ("UNKNOWN", "UNSIGNED", "N/A", "ERR:NOT-REPORTED"):
+                        severity = SEVERITY_THRESHOLDS["signer_changed_if_unsigned"]
+
+                    # Create an alert immediately (or append as anomaly if you’re already building anomalies)
+                    event_time = row.get('CreationTime')
+                    alert_timestamp = str(int(event_time)) if event_time and pd.notna(event_time) else "UNKNOWN"
+
+                    all_alerts.append({
+                        "timestamp": alert_timestamp,
+                        "machine": row["MachineName"],
+                        "process": row["ProcessName"],
+                        "pid": int(row["Pid"]) if pd.notna(row["Pid"]) else 0,
+                        "user": user,
+                        "signer": signer,
+                        "process_args": str(row.get("ProcessArgs", ""))[:200],
+                        "anomaly_count": 1,
+                        "baseline_context": {
+                            "matched_triplet": f"{row['MachineName']} | {row['ProcessName']} | {normalized_args[:80]}",
+                            "baseline_signers_for_triplet": list(set(same_triplet_signers))[:10],
+                            "current_signer": signer,
+                            "status": "SIGNER_CHANGED"
+                        },
+                        'anomalies': [
+                                self._make_anomaly(
+                                    type="ALERT_PROCESS_SIGNER_CHANGED",
+                                    severity=severity,
+                                    details=(
+                                        f"Signer changed for {row['ProcessName']} on {row['MachineName']}: "
+                                        f"'{signer}' not in baseline signers {list(set(same_triplet_signers))[:5]}"
+                                    ),
+                                    row=row,
+                                    baseline=None,  # baseline exists for other signer(s), but not for this exact key
+                                    normalized_args=normalized_args,
+                                    occurrence_count=0,
+                                    baseline_context={
+                                        "status": "SIGNER_CHANGED",
+                                        "baseline_signers_for_triplet": list(set(same_triplet_signers))[:10],
+                                        "current_signer": signer
+                                    },
+                                    extra={
+                                        "process_name": row["ProcessName"],
+                                        "current_signer": signer,
+                                        "baseline_signers_for_triplet": list(set(same_triplet_signers))[:10],
+                                        "normalized_args": normalized_args[:200],
+                                    }
+                                )
+                            ]
+                    })
+                    # Optional: continue so you don't also emit NEW_AI_AGENT_NOT_IN_BASELINE
+                    continue
+
+                
+                
                 if key not in baselines:
                     unmatched_keys += 1
                     if unmatched_keys <= 3:  # Show first 3 misses
@@ -1372,9 +1410,12 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                         truly_new_domains.append(domain)
                 
                 if truly_new_domains:
+                    severity = "MEDIUM"
+                    if len(truly_new_domains) >= SEVERITY_THRESHOLDS["new_domains_high"]:
+                        severity = "HIGH"
                     anomalies.append(self._make_anomaly(
                         type="ALERT_NEW_DOMAINS",
-                        severity="HIGH",
+                        severity=severity,
                         details=f"Contacted {len(truly_new_domains)} new domains",
                         row=row,
                         baseline=baseline,
@@ -1420,10 +1461,13 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                 
                 new_ports = current_ports - baseline_ports
                 if new_ports:
+                    severity = "LOW"
+                    if len(new_ports) >= SEVERITY_THRESHOLDS["new_ports_medium"]:
+                        severity = "MEDIUM"
                     anomalies.append(
                         self._make_anomaly(
                             type="ALERT_NEW_PORTS",
-                            severity="MEDIUM",
+                            severity=severity,
                             details=f"Connected to {len(new_ports)} new port(s)",
                             row=row,
                             baseline=baseline,
@@ -1494,7 +1538,11 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                 
                 # ===== Check EXCESSIVE TRANSFER =====
                 avg_sent = baseline['stats'].get('avg_bytes_sent', 0)
+                mb_sent = row['NetworkBytesSent_sum'] / 1e6
                 if avg_sent > 0 and row['NetworkBytesSent_sum'] > avg_sent * 10:
+                    severity = "HIGH"
+                    if mb_sent >= SEVERITY_THRESHOLDS["excessive_transfer_mb_critical"]:
+                        severity = "CRITICAL"
                     anomalies.append(
                         self._make_anomaly(
                             type="ALERT_EXCESSIVE_TRANSFER",
@@ -1567,7 +1615,7 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                         truly_new_files.append(curr_file)
 
                 # Only alert if accessing many new files (could be normal for some apps)
-                if len(truly_new_files) > 5:
+                if len(truly_new_files) >= SEVERITY_THRESHOLDS["new_files_medium"]:
                     anomalies.append(
                         self._make_anomaly(
                             type="ALERT_ACCESSING_MANY_NEW_FILES",
@@ -2084,7 +2132,43 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                     fname: {'first_seen': current_date, 'last_seen': current_date}
                     for fname in baseline.get('file_operations', {}).keys()
                 }
-            
+            for d in list(baseline.get('accessed_dirs', set())):
+                baseline['accessed_dirs_meta'].setdefault(d, {
+                    'first_seen': current_date,
+                    'last_seen': current_date,
+                    'count': 1
+                })
+
+            for dom in list(baseline.get('contacted_domains', set())):
+                baseline['contacted_domains_meta'].setdefault(dom, {
+                    'first_seen': current_date,
+                    'last_seen': current_date,
+                    'count': 1
+                })
+                
+            # Repair missing file_operations_meta entries (handles partial meta dicts)
+            baseline.setdefault('file_operations_meta', {})
+            for fname in list(baseline.get('file_operations', {}).keys()):
+                baseline['file_operations_meta'].setdefault(fname, {
+                    'first_seen': current_date,
+                    'last_seen': current_date
+                })
+
+            # --- Repair partial meta dicts (prevents KeyError drift) ---
+            baseline.setdefault('accessed_dirs_meta', {})
+            for d in list(baseline.get('accessed_dirs', set())):
+                baseline['accessed_dirs_meta'].setdefault(d, {'first_seen': current_date, 'last_seen': current_date, 'count': 1})
+
+            baseline.setdefault('contacted_domains_meta', {})
+            for dom in list(baseline.get('contacted_domains', set())):
+                baseline['contacted_domains_meta'].setdefault(dom, {'first_seen': current_date, 'last_seen': current_date, 'count': 1})
+
+            baseline.setdefault('file_operations_meta', {})
+            for fname in list(baseline.get('file_operations', {}).keys()):
+                baseline['file_operations_meta'].setdefault(fname, {'first_seen': current_date, 'last_seen': current_date})
+
+
+
             # === DECAY: Remove old items ===
             # Remove expired directories
             expired_dirs = []
@@ -2147,7 +2231,11 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                 # Add or update directories
                 for norm_dir, count in dir_counts.items():
                     if norm_dir in baseline['accessed_dirs']:
-                        # Already in baseline - update last_seen and count
+                        baseline['accessed_dirs_meta'].setdefault(norm_dir, {
+                            'first_seen': current_date,
+                            'last_seen': current_date,
+                            'count': 0
+                        })
                         baseline['accessed_dirs_meta'][norm_dir]['last_seen'] = current_date
                         baseline['accessed_dirs_meta'][norm_dir]['count'] = baseline['accessed_dirs_meta'][norm_dir].get('count', 0) + count
                     elif count >= min_occurrences:
@@ -2174,7 +2262,11 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                 # Add or update domains
                 for domain, count in domain_counts.items():
                     if domain in baseline['contacted_domains']:
-                        # Already in baseline - update last_seen
+                        baseline['contacted_domains_meta'].setdefault(domain, {
+                            'first_seen': current_date,
+                            'last_seen': current_date,
+                            'count': 0
+                        })
                         baseline['contacted_domains_meta'][domain]['last_seen'] = current_date
                         baseline['contacted_domains_meta'][domain]['count'] = baseline['contacted_domains_meta'][domain].get('count', 0) + count
                     elif count >= min_occurrences:
@@ -2211,6 +2303,10 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                     baseline['file_operations'][fname]['operations'].update(fdata['operations'])
                     baseline['file_operations'][fname]['users'].update(fdata['users'])
                     baseline['file_operations'][fname]['process_args'].update(fdata['process_args'])
+                    baseline['file_operations_meta'].setdefault(fname, {
+                        'first_seen': current_date,
+                        'last_seen': current_date
+                    })
                     baseline['file_operations_meta'][fname]['last_seen'] = current_date
                 else:
                     baseline['file_operations'][fname] = fdata
@@ -2242,7 +2338,7 @@ def execute(cluster, database, tenant, output_dir, mode, lookback_unit='day',
     detector = AIAgentAnomalyDetector(cluster, database, tenant, output_dir)
     
     print("="*80)
-    print(f"🤖 AI Agent Anomaly 9 Detection for {tenant}")
+    print(f"🤖 AI Agent Anomaly 10 Detection for {tenant}")
     print("="*80)
     
     if mode == 'bootstrap':
