@@ -6,10 +6,10 @@ import os
 from datetime import datetime, timedelta
 import argparse
 #import ai_anomaly_detector
-import AIModelAndDetect9
+import AIModelAndDetect11
 from multiprocessing import Process
 #from ai_anomaly_detector import execute
-from AIModelAndDetect9 import execute
+from AIModelAndDetect11 import execute
 import time
 import json, random
 import hashlib
@@ -206,7 +206,7 @@ def collect_for_tenant(cluster, database, tenant, output_dir, mode, lookback_uni
         print (f"⏭️ Wrapper - creating/addoing baseline for: ",baseline_file)
         print ("============")
         
-        AIModelAndDetect9.execute(
+        AIModelAndDetect11.execute(
             cluster=cluster,
             database=database,
             tenant=tenant,
