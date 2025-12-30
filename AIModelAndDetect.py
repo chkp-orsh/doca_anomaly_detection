@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from azure.kusto.data import KustoClient, KustoConnectionStringBuilder, ClientRequestProperties
 from azure.kusto.data.helpers import dataframe_from_result_table
 from collections import defaultdict
+from difflib import SequenceMatcher
 
 import warnings
 warnings.filterwarnings('ignore')
@@ -655,6 +656,7 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                 reason_details['example_behavior']['process_dir'] = row.get('ProcessDir', '')
                 
                 baselines[key]['detection_reason'] = reason_details
+       
             
             domains_raw = row.get('contacted_domains')
             if isinstance(domains_raw, list):
@@ -715,6 +717,15 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
             
             if pd.notna(row.get('ProcessArgs')):
                 baselines[key]['process_args'].add(row['ProcessArgs'])
+            
+                        # NEW: Track normalized process directories
+            if pd.notna(row.get('ProcessDir')):
+                norm_proc_dir = self._normalize_directory_path(row['ProcessDir'])
+                if norm_proc_dir:
+                    if 'process_dirs' not in baselines[key]:
+                        baselines[key]['process_dirs'] = set()
+                    baselines[key]['process_dirs'].add(norm_proc_dir)
+            
             
             if pd.notna(row.get('file_mod_details')):
                 try:
@@ -867,291 +878,7 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
         return dict(baselines)
     
     
-    
-    
-    def build_baseline_old(self, df_process_list, df_children_list):
-        
-        
-        """Build baseline with statistical modeling"""
-        print("\n🔨 Building statistical baselines...")
-        
-        df_process = pd.concat(df_process_list, ignore_index=True) if df_process_list else pd.DataFrame()
-        df_children = pd.concat(df_children_list, ignore_index=True) if df_children_list else pd.DataFrame()
-        
-        baselines = defaultdict(lambda: {
-            'spawned_processes': set(),
-            'spawned_args': set(),
-            'spawned_with_args': set(),
-            'contacted_domains': set(),
-            'contacted_ips': set(),
-            'contacted_ports': set(),
-            'network_paths': set(),
-            'accessed_files': set(),
-            'accessed_dirs': set(),
-            'accessed_extensions': set(),
-            'users': set(),
-            'process_args': set(),
-            'file_operations': {},
-            'stats': {
-                'instances': 0,
-                'bytes_sent_mean': 0.0,
-                'bytes_sent_std': 0.0,
-                'bytes_sent_p50': 0.0,
-                'bytes_sent_p95': 0.0,
-                'bytes_sent_p99': 0.0,
-                'bytes_received_mean': 0.0,
-                'bytes_received_std': 0.0,
-                'bytes_received_p95': 0.0,
-                'domain_count_mean': 0.0,
-                'domain_count_std': 0.0,
-                'domain_count_p95': 0.0,
-                'file_count_mean': 0.0,
-                'file_count_std': 0.0,
-                'dir_count_mean': 0.0,
-                'dir_count_std': 0.0,
-                'children_count_mean': 0.0,
-                'children_count_std': 0.0,
-            },
-            'occurrence_count': 0
-        })
-        
-        # Build from process data
-        for _, row in df_process.iterrows():
-            normalized_args = self._normalize_process_args(row.get('ProcessArgs'))
-            user = row.get('UserName', 'UNKNOWN')
-            signer = self._normalize_signer(row.get('ProcessSigner'))
-            key = (row['MachineName'], row['ProcessName'], normalized_args, signer)
-            
-            if 'detection_reason' not in baselines[key]:
-                reason_details = {
-                    'first_detected': self._get_current_date(),
-                    'ai_score': float(row.get('aiScore_avg', 0)) if pd.notna(row.get('aiScore_avg')) else 0,
-                    'detection_triggers': [],
-                    'example_behavior': {}
-                }
-                
-                if row.get('model_files_count', 0) > 0:
-                    reason_details['detection_triggers'].append(f"Model files ({row.get('model_files_count', 0)} files)")
-                
-                if row.get('llm_api_count', 0) > 0:
-                    reason_details['detection_triggers'].append(f"LLM API calls ({row.get('llm_api_count', 0)})")
-                    domains = self._safe_parse_list(row.get('contacted_domains'))
-                    reason_details['example_behavior']['llm_domains'] = list(set(domains))[:3]
-                
-                if row.get('suspicious_args_count', 0) > 0:
-                    reason_details['detection_triggers'].append("Suspicious arguments")
-                
-                reason_details['example_behavior']['process_dir'] = row.get('ProcessDir', '')
-                
-                baselines[key]['detection_reason'] = reason_details
-            
-            domains_raw = row.get('contacted_domains')
-            if isinstance(domains_raw, list):
-                baselines[key]['contacted_domains'].update([d for d in domains_raw if d])
-            elif pd.notna(domains_raw):
-                try:
-                    domains = self._safe_parse_list(domains_raw)
-                    baselines[key]['contacted_domains'].update([d for d in domains if d])
-                except: pass
-            
-            ips_raw = row.get('contacted_ips')
-            if isinstance(ips_raw, list):
-                baselines[key]['contacted_ips'].update([d for d in ips_raw if d])
-            elif pd.notna(ips_raw):
-                try:
-                    ips = self._safe_parse_list(ips_raw)
-                    baselines[key]['contacted_ips'].update([d for d in ips if d])
-                except: pass
-            
-            ports_raw = row.get('contacted_ports')
-            if isinstance(ports_raw, list):
-                baselines[key]['contacted_ports'].update([str(p) for p in ports_raw if p])
-            elif pd.notna(ports_raw):
-                try:
-                    ports = self._safe_parse_list(ports_raw)
-                    baselines[key]['contacted_ports'].update([str(p) for p in ports if p])
-                except: pass
-            
-            network_path_raw = row.get('network_paths')
-            if isinstance(network_path_raw, list):
-                baselines[key]['network_paths'].update([p for p in network_path_raw if p])
-            elif pd.notna(network_path_raw):
-                try:
-                    paths = self._safe_parse_list(network_path_raw)
-                    baselines[key]['network_paths'].update([p for p in paths if p])
-                except: pass
-            
-            a_fs = row.get('accessed_files')
-            if isinstance(a_fs, list):
-                try:
-                    baselines[key]['accessed_files'].update([self._normalize_filename(f) for f in a_fs if f])
-                except: pass
-
-            dirs = row.get('accessed_dirs')
-            if isinstance(dirs, list):
-                try:
-                    baselines[key]['accessed_dirs'].update([self._normalize_directory_path(d) for d in dirs if d])
-                except: pass
-            
-            exts = row.get('accessed_extensions')
-            if isinstance(exts, list):
-                try:
-                    baselines[key]['accessed_extensions'].update([e for e in exts if e])
-                except: pass
-            
-            if pd.notna(row.get('UserName')):
-                baselines[key]['users'].add(row['UserName'])
-            
-            if pd.notna(row.get('ProcessArgs')):
-                baselines[key]['process_args'].add(row['ProcessArgs'])
-            
-            if pd.notna(row.get('file_mod_details')):
-                try:
-                    ops = self._safe_parse_list(row['file_mod_details'])
-                    if not isinstance(ops, list):
-                        ops = [ops]
-                    
-                    for op in ops:
-                        filename_raw = op.get('file')
-                        if not filename_raw:
-                            continue
-                        
-                        filename = self._normalize_filename(filename_raw)
-                        
-                        if filename not in baselines[key]['file_operations']:
-                            baselines[key]['file_operations'][filename] = {
-                                'operations': set(),
-                                'users': set(),
-                                'process_args': set()
-                            }
-                        
-                        if op.get('user'):
-                            baselines[key]['file_operations'][filename]['users'].add(op['user'])
-                        if op.get('args'):
-                            norm_args = self._normalize_process_args(op['args'])
-                            baselines[key]['file_operations'][filename]['process_args'].add(norm_args)
-                except Exception as e:
-                    pass
-        
-        # Build from child data
-        if not df_children.empty and 'MachineName' in df_children.columns:
-            for _, child_row in df_children.iterrows():
-                parent_match = df_process[
-                    (df_process['MachineName'] == child_row['MachineName']) &
-                    (df_process['PidCreationTime'] == child_row['ProcessPPidCreationTime'])
-                ]
-                
-                if len(parent_match) == 0:
-                    continue
-                
-                parent = parent_match.iloc[0]
-                
-                normalized_parent_args = self._normalize_process_args(parent.get('ProcessArgs'))
-                parent_signer = self._normalize_signer(parent.get('ProcessSigner'))
-                key = (child_row['MachineName'], parent['ProcessName'], normalized_parent_args, parent_signer)
-                            
-                child_process = child_row.get('ProcessName')
-                child_args_normalized = self._normalize_process_args(child_row.get('ProcessArgs'))
-                
-                if child_process:
-                    baselines[key]['spawned_processes'].add(child_process)
-                    baselines[key]['spawned_with_args'].add((child_process, child_args_normalized))
-                
-                if child_row.get('ProcessArgs'):
-                    baselines[key]['spawned_args'].add(child_row['ProcessArgs'])
-            
-        # Compute statistical measures
-        print("📊 Computing statistical models...")
-        for key in baselines:
-            machine, process, normalized_args, signer = key
-    
-            matching_rows = df_process[
-                (df_process['MachineName'] == machine) & 
-                (df_process['ProcessName'] == process) &
-                (df_process['ProcessArgs'].apply(lambda x: self._normalize_process_args(x)) == normalized_args) &
-                (df_process['ProcessSigner'].apply(lambda x: self._normalize_signer(x)) == signer)
-            ]
-                    
-            if len(matching_rows) > 0:
-                bytes_sent = matching_rows['NetworkBytesSent_sum'].fillna(0)
-                bytes_received = matching_rows['NetworkBytesReceived_sum'].fillna(0)
-                
-                baselines[key]['stats'] = {
-                    'instances': len(matching_rows),
-                    'bytes_sent_mean': float(bytes_sent.mean()),
-                    'bytes_sent_std': float(bytes_sent.std()) if len(bytes_sent) > 1 else 0.0,
-                    'bytes_sent_p50': float(bytes_sent.quantile(0.50)),
-                    'bytes_sent_p95': float(bytes_sent.quantile(0.95)),
-                    'bytes_sent_p99': float(bytes_sent.quantile(0.99)),
-                    'bytes_received_mean': float(bytes_received.mean()),
-                    'bytes_received_std': float(bytes_received.std()) if len(bytes_received) > 1 else 0.0,
-                    'bytes_received_p95': float(bytes_received.quantile(0.95)),
-                    'domain_count_mean': 0.0,
-                    'domain_count_std': 0.0,
-                    'domain_count_p95': 0.0,
-                    'file_count_mean': 0.0,
-                    'file_count_std': 0.0,
-                    'dir_count_mean': 0.0,
-                    'dir_count_std': 0.0,
-                    'children_count_mean': 0.0,
-                    'children_count_std': 0.0,
-                }
-                
-                domain_counts = []
-                for _, row in matching_rows.iterrows():
-                    domains = self._safe_parse_list(row.get('contacted_domains'))
-                    domain_counts.append(len([d for d in domains if d]))
-                
-                if domain_counts:
-                    baselines[key]['stats']['domain_count_mean'] = float(np.mean(domain_counts))
-                    baselines[key]['stats']['domain_count_std'] = float(np.std(domain_counts)) if len(domain_counts) > 1 else 0.0
-                    baselines[key]['stats']['domain_count_p95'] = float(np.percentile(domain_counts, 95))
-                
-                file_counts = []
-                dir_counts = []
-                for _, row in matching_rows.iterrows():
-                    files = self._safe_parse_list(row.get('accessed_files'))
-                    dirs = self._safe_parse_list(row.get('accessed_dirs'))
-                    file_counts.append(len([f for f in files if f]))
-                    dir_counts.append(len([d for d in dirs if d]))
-                
-                if file_counts:
-                    baselines[key]['stats']['file_count_mean'] = float(np.mean(file_counts))
-                    baselines[key]['stats']['file_count_std'] = float(np.std(file_counts)) if len(file_counts) > 1 else 0.0
-                
-                if dir_counts:
-                    baselines[key]['stats']['dir_count_mean'] = float(np.mean(dir_counts))
-                    baselines[key]['stats']['dir_count_std'] = float(np.std(dir_counts)) if len(dir_counts) > 1 else 0.0
-                
-                children_counts = []
-                if not df_children.empty and 'MachineName' in df_children.columns:
-                    for _, row in matching_rows.iterrows():
-                        children = df_children[
-                            (df_children['MachineName'] == machine) &
-                            (df_children['ProcessPPidCreationTime'] == row['PidCreationTime'])
-                        ]
-                        children_counts.append(len(children))
-                    
-                if children_counts:
-                    baselines[key]['stats']['children_count_mean'] = float(np.mean(children_counts))
-                    baselines[key]['stats']['children_count_std'] = float(np.std(children_counts)) if len(children_counts) > 1 else 0.0
-                
-                occurrence_count = 0
-                for df in df_process_list:
-                    period_matches = df[
-                        (df['MachineName'] == machine) & 
-                        (df['ProcessName'] == process) &
-                        (df['ProcessArgs'].apply(lambda x: self._normalize_process_args(x)) == normalized_args) &
-                        (df['ProcessSigner'].apply(lambda x: self._normalize_signer(x)) == signer)
-                    ]
-                    if len(period_matches) > 0:
-                        occurrence_count += 1
-                
-                baselines[key]['occurrence_count'] = occurrence_count
-        
-        print(f"✅ Built statistical baselines for {len(baselines)} combinations")
-        return dict(baselines)
-    
+  
     def save_baseline(self, baselines):
         """Save baseline to JSON"""
         baselines_json = {}
@@ -1196,6 +923,7 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                     'accessed_extensions': safe_convert_list(baseline['accessed_extensions'], 'accessed_extensions'),
                     'users': [self._obfuscate_user_name(u) for u in baseline['users']],
                     'process_args': safe_convert_list(baseline['process_args'], 'process_args'),
+                    'process_dirs': safe_convert_list(baseline.get('process_dirs', set()), 'process_dirs'),
                     'file_operations': {
                         fname: {
                             'operations': safe_convert_list(fdata['operations'], f'file_operations[{fname}].operations'),
@@ -1284,6 +1012,7 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                 'accessed_extensions': set(baseline['accessed_extensions']),
                 'users': set(self._deobfuscate_user_name(u) for u in baseline['users']),
                 'process_args': set(baseline['process_args']),
+                'process_dirs': set(baseline.get('process_dirs', [])),
                 'file_operations': {
                     fname: {
                         'operations': set(fdata['operations']),
@@ -1398,7 +1127,7 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                         'max_confidence_score': confidence,
                         'anomalies': [
                             self._make_anomaly(
-                                type="ALERT_NEW_AI_AGENT_NOT_IN_BASELINE",
+                                type="EVENT_NEW_AI_AGENT_NOT_IN_BASELINE",
                                 severity=severity,
                                 details=f"New AI agent not in baseline: {row['ProcessName']} - {distance_details.get('reason', 'unknown')}",
                                 row=row,
@@ -1442,7 +1171,7 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                         'max_confidence_score': learning_confidence,
                         'anomalies': [
                             self._make_anomaly(
-                                type="ALERT_AI_AGENT_IN_LEARNING_PHASE",
+                                type="LOG_AI_AGENT_IN_LEARNING_PHASE",
                                 severity="INFO",
                                 details=f"Learning: {row['ProcessName']} seen {occurrence_count}/{min_occurrences}",
                                 row=row,
@@ -1460,6 +1189,53 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                 
                 event_time = row.get('CreationTime')
                 alert_timestamp = str(int(event_time)) if event_time and pd.notna(event_time) else "UNKNOWN"
+                
+                # In detect_anomalies(), after finding baseline match:
+
+                # Check if ProcessDir is in baseline
+                if 'process_dirs' not in baseline:
+                    baseline['process_dirs'] = set()
+
+                baseline_dirs = baseline.get('process_dirs', set())
+                current_dir = self._normalize_directory_path(row.get('ProcessDir', ''))
+
+                if current_dir and current_dir not in baseline_dirs:
+                    # Check similarity to existing dirs
+                    is_novel, confidence, best_match = self.stats_helper.novelty_score(
+                        current_dir,
+                        baseline_dirs,
+                        threshold=0.85
+                    )
+                    
+                    if is_novel:
+                        severity = "CRITICAL"  # Process running from new location!
+                        
+                        # Extra critical if it's a suspicious location
+                        SUSPICIOUS_PATHS = ['temp', 'tmp', 'downloads', 'public', 'appdata\\local\\temp']
+                        if any(susp in current_dir.lower() for susp in SUSPICIOUS_PATHS):
+                            severity = "CRITICAL"
+                            confidence = min(confidence + 0.1, 1.0)
+                        
+                        anomalies.append(
+                            self._make_anomaly(
+                                type="ALERT_PROCESS_RUNNING_FROM_NEW_LOCATION",
+                                severity=severity,
+                                details=f"Process {row['ProcessName']} running from NEW location: {current_dir}",
+                                row=row,
+                                baseline=baseline,
+                                normalized_args=normalized_args,
+                                occurrence_count=occurrence_count,
+                                confidence_score=confidence,
+                                extra={
+                                    "current_process_dir": current_dir,
+                                    "baseline_process_dirs": list(baseline_dirs)[:10],
+                                    "is_suspicious_location": any(susp in current_dir.lower() for susp in SUSPICIOUS_PATHS)
+                                }
+                            )
+                        )
+                
+                
+                
                 
                 # USER CHECK
                 baseline_users = baseline.get('users', set())
@@ -1639,16 +1415,97 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                         )
                     )
                 
-                # [Continue with remaining detection types...]
-                # MODEL FILE MODIFICATIONS
+                # ===== Check NEW FILE EXTENSIONS =====
+                exts_raw = row.get('accessed_extensions')
+                current_exts = set(e for e in self._safe_parse_list(exts_raw) if e and str(e).strip())
+                baseline_exts = baseline.get('accessed_extensions', set())
+
+                new_exts = current_exts - baseline_exts
+                COMMON_EXTS = {'txt', 'log', 'tmp', 'cache', 'json', 'xml', 'yml', 'yaml'}
+                suspicious_exts = new_exts - COMMON_EXTS
+
+                if suspicious_exts:
+                    SUSPICIOUS_EXT_TYPES = {'exe', 'dll', 'bat', 'ps1', 'vbs', 'js', 'py', 'sh'}
+                    high_risk_exts = suspicious_exts & SUSPICIOUS_EXT_TYPES
+                    ext_confidence = 0.9 if high_risk_exts else 0.7
+                    
+                    anomalies.append(
+                        self._make_anomaly(
+                            type="ALERT_NEW_FILE_EXTENSIONS",
+                            severity="MEDIUM",
+                            details=f"Accessed {len(suspicious_exts)} new file extension(s)",
+                            row=row,
+                            baseline=baseline,
+                            normalized_args=normalized_args,
+                            occurrence_count=occurrence_count,
+                            confidence_score=ext_confidence,
+                            baseline_context={
+                                "status": "ACTIVE_DETECTION",
+                                "reason": "NEW_FILE_EXTENSIONS"
+                            },
+                            extra={
+                                "new_extensions": list(suspicious_exts),
+                                "high_risk_extensions": list(high_risk_exts) if high_risk_exts else [],
+                                "baseline_extensions": list(baseline_exts)[:20]
+                            }
+                        )
+                    )
+
+                # ===== Check NEW FILES ACCESSED =====
+                files_raw = row.get('accessed_files')
+                files_list = self._safe_parse_list(files_raw)
+                current_files = set(self._normalize_filename(f) for f in files_list if f)
+                baseline_files = baseline.get('accessed_files', set())
+
+                file_threshold = self.stats_helper.adaptive_threshold(baseline_files, default=0.80)
+
+                truly_new_files = []
+                file_confidences = []
+                for curr_file in current_files:
+                    is_novel, confidence, match = self.stats_helper.novelty_score(
+                        curr_file, baseline_files, threshold=file_threshold
+                    )
+                    if is_novel:
+                        truly_new_files.append(curr_file)
+                        file_confidences.append(confidence)
+
+                if len(truly_new_files) >= SEVERITY_THRESHOLDS.get("new_files_medium", 10):
+                    avg_confidence = np.mean(file_confidences) if file_confidences else 0.6
+                    
+                    anomalies.append(
+                        self._make_anomaly(
+                            type="ALERT_ACCESSING_MANY_NEW_FILES",
+                            severity="MEDIUM",
+                            details=f"Accessed {len(truly_new_files)} new files (threshold: {file_threshold:.2f})",
+                            row=row,
+                            baseline=baseline,
+                            normalized_args=normalized_args,
+                            occurrence_count=occurrence_count,
+                            confidence_score=float(avg_confidence),
+                            baseline_context={
+                                "status": "ACTIVE_DETECTION",
+                                "reason": "MANY_NEW_FILES",
+                                "adaptive_threshold": f"{file_threshold:.2f}"
+                            },
+                            extra={
+                                "new_files_sample": truly_new_files[:20],
+                                "file_confidences": [f"{c:.2f}" for c in file_confidences[:10]],
+                                "baseline_files_sample": list(baseline_files)[:20]
+                            }
+                        )
+                    )
+                
+                
+                
+                # ===== Check MODEL FILE MODIFICATIONS =====
                 mod_files_raw = row.get('modified_model_files')
                 modified_raw = [f for f in self._safe_parse_list(mod_files_raw) if f]
                 modified = {self._normalize_filename(f): f for f in modified_raw}
-                
+
                 mod_details_raw = row.get('file_mod_details')
                 mod_details = self._safe_parse_list(mod_details_raw)
                 baseline_file_ops = baseline.get('file_operations', {})
-                
+
                 for norm_file, original_file in modified.items():
                     file_mod_info = None
                     for detail in mod_details:
@@ -1657,29 +1514,154 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                             break
                     
                     mod_user = file_mod_info.get('user') if file_mod_info else None
+                    mod_args = file_mod_info.get('args') if file_mod_info else None
                     
                     file_in_baseline = False
+                    matching_baseline_file = None
+                    
                     for baseline_file in baseline_file_ops.keys():
-                        if SequenceMatcher(None, norm_file.lower(), baseline_file.lower()).ratio() >= 0.90:
+                        similarity = SequenceMatcher(None, norm_file.lower(), baseline_file.lower()).ratio()
+                        if similarity >= 0.90:
                             file_in_baseline = True
+                            matching_baseline_file = baseline_file
                             break
                     
                     if not file_in_baseline:
+                        # FIRST TIME modification - NEVER modified before
+                        domains = row.get('contacted_domains')
+                        ips = row.get('contacted_ips')
+                        
                         anomalies.append(
                             self._make_anomaly(
                                 type="ALERT_NEW_MODEL_FILE_MODIFICATION",
                                 severity="CRITICAL",
-                                details=f"FIRST TIME: {original_file}",
+                                details=f"FIRST TIME MODIFICATION: Model file {original_file} has never been modified before",
                                 row=row,
                                 baseline=baseline,
                                 normalized_args=normalized_args,
                                 occurrence_count=occurrence_count,
                                 confidence_score=0.98,
-                                extra={"file": original_file}
+                                baseline_context={
+                                    "status": "ACTIVE_DETECTION",
+                                    "reason": "FIRST_MODEL_MODIFICATION"
+                                },
+                                extra={
+                                    "file": original_file,
+                                    "normalized_file": norm_file,
+                                    "file_type": original_file.split('.')[-1] if '.' in original_file else "unknown",
+                                    "modifying_user": mod_user,
+                                    "modifying_process": row["ProcessName"],
+                                    "modifying_process_args": str(row.get("ProcessArgs", ""))[:500],
+                                    "modifying_pid": int(row["Pid"]) if pd.notna(row["Pid"]) else None,
+                                    "contacted_domains": (
+                                        list(ast.literal_eval(domains))[:10]
+                                        if isinstance(domains, str)
+                                        else list(domains)[:10] if isinstance(domains, (list, tuple))
+                                        else []
+                                    ),
+                                    "network_bytes_sent": int(row.get("NetworkBytesSent_sum", 0)),
+                                    "all_baseline_model_files_ever_modified": list(baseline_file_ops.keys())[:20],
+                                    "baseline_normal_users": list(baseline.get("users", set()))[:10]
+                                }
                             )
                         )
-                
+                    else:
+                        # File was modified before - check if by NEW USER or with UNUSUAL ARGS
+                        file_baseline = baseline_file_ops[matching_baseline_file]
+                        
+                        # Check USER
+                        if mod_user and mod_user not in file_baseline.get('users', set()):
+                            # But only alert if user is NOT in the overall baseline for this process
+                            baseline_users = baseline.get('users', set())
+                            severity = 'CRITICAL' if mod_user not in baseline_users else 'MEDIUM'
+                            user_mod_confidence = 0.95 if severity == 'CRITICAL' else 0.75
+                            
+                            anomalies.append(
+                                self._make_anomaly(
+                                    type="ALERT_MODEL_FILE_MODIFIED_BY_NEW_USER",
+                                    severity=severity,
+                                    details=(
+                                        f"Model file {original_file} modified by "
+                                        f"{'UNAUTHORIZED' if severity == 'CRITICAL' else 'unusual'} user {mod_user}"
+                                    ),
+                                    row=row,
+                                    baseline=baseline,
+                                    normalized_args=normalized_args,
+                                    occurrence_count=occurrence_count,
+                                    confidence_score=user_mod_confidence,
+                                    baseline_context={
+                                        "status": "ACTIVE_DETECTION",
+                                        "reason": "MODEL_MODIFIED_BY_NEW_USER",
+                                        "file_user_authorization": (
+                                            "UNAUTHORIZED" if severity == "CRITICAL" else "UNUSUAL"
+                                        )
+                                    },
+                                    extra={
+                                        "file": original_file,
+                                        "normalized_file": norm_file,
+                                        "current_user": mod_user,
+                                        "current_process": row["ProcessName"],
+                                        "baseline_authorized_users_for_file": list(file_baseline.get("users", set())),
+                                        "baseline_all_users_for_process": list(baseline_users)[:10],
+                                        "network_bytes_sent": int(row.get("NetworkBytesSent_sum", 0)),
+                                    }
+                                )
+                            )
+                        
+                        # Check ARGS similarity
+                        if mod_args:
+                            baseline_args = file_baseline.get('process_args', set())
+                            if baseline_args:
+                                norm_current = self._normalize_process_args(mod_args)
+                                max_sim = 0
+                                best_match = None
+                                for baseline_arg in baseline_args:
+                                    sim = SequenceMatcher(None, norm_current, baseline_arg).ratio()
+                                    if sim > max_sim:
+                                        max_sim = sim
+                                        best_match = baseline_arg
+                                
+                                # Lower threshold to 0.5 to reduce false positives
+                                if max_sim < 0.5:
+                                    args_confidence = 1.0 - max_sim
+                                    
+                                    anomalies.append(
+                                        self._make_anomaly(
+                                            type="ALERT_MODEL_FILE_MODIFIED_WITH_UNUSUAL_ARGS",
+                                            severity="HIGH",
+                                            details=(
+                                                f"Model file {original_file} modified with unusual arguments "
+                                                f"(similarity: {max_sim:.2f})"
+                                            ),
+                                            row=row,
+                                            baseline=baseline,
+                                            normalized_args=normalized_args,
+                                            occurrence_count=occurrence_count,
+                                            confidence_score=args_confidence,
+                                            baseline_context={
+                                                "status": "ACTIVE_DETECTION",
+                                                "reason": "UNUSUAL_MODEL_ARGS"
+                                            },
+                                            extra={
+                                                "file": original_file,
+                                                "normalized_file": norm_file,
+                                                "current_args": str(mod_args)[:500],
+                                                "similarity_to_best_baseline": f"{max_sim:.2f}",
+                                                "best_matching_baseline_arg": (
+                                                    str(best_match)[:200] if best_match else None
+                                                ),
+                                                "modifying_user": mod_user,
+                                                "modifying_process": row["ProcessName"]
+                                            }
+                                        )
+                                    )
+
+
+
+          
+          
                 # CHILD SPAWNING (check if df_children has data)
+                # ===== Check CHILD SPAWNING =====
                 if not df_children.empty and 'MachineName' in df_children.columns:
                     children_of_this = df_children[
                         (df_children['MachineName'] == row['MachineName']) &
@@ -1690,16 +1672,18 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
 
                     for _, child in children_of_this.iterrows():
                         child_process = child.get('ProcessName')
+                        child_args = child.get('ProcessArgs')
+                        
                         if not child_process or not str(child_process).strip():
                             continue
                         
-                        child_args_norm = self._normalize_process_args(child.get('ProcessArgs'))
+                        child_args_norm = self._normalize_process_args(child_args)
                         exact_match = (child_process, child_args_norm) in baseline_spawned
                         
                         if not exact_match:
-                            baseline_args = [args for proc, args in baseline_spawned if proc == child_process]
+                            baseline_args_for_proc = [args for proc, args in baseline_spawned if proc == child_process]
                                 
-                            if not baseline_args:
+                            if not baseline_args_for_proc:
                                 anomalies.append(
                                     self._make_anomaly(
                                         type="ALERT_NEW_SPAWNED_PROCESS",
@@ -1710,9 +1694,58 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                                         normalized_args=normalized_args,
                                         occurrence_count=occurrence_count,
                                         confidence_score=0.95,
-                                        extra={"child_process": child_process}
+                                        baseline_context={
+                                            "status": "ACTIVE_DETECTION",
+                                            "reason": "NEW_SPAWNED_PROCESS"
+                                        },
+                                        extra={
+                                            "child_process": child_process,
+                                            "child_args": str(child_args)[:200] if child_args else ""
+                                        }
                                     )
                                 )
+                            else:
+                                # Process was spawned before - check arg similarity
+                                max_similarity = 0
+                                best_baseline_arg = None
+                                for baseline_arg in baseline_args_for_proc:
+                                    sim = SequenceMatcher(None, child_args_norm, baseline_arg).ratio()
+                                    if sim > max_similarity:
+                                        max_similarity = sim
+                                        best_baseline_arg = baseline_arg
+                                
+                                if max_similarity < 0.7:
+                                    spawn_confidence = 1.0 - max_similarity
+                                    
+                                    anomalies.append(
+                                        self._make_anomaly(
+                                            type="ALERT_SPAWNED_PROCESS_UNUSUAL_ARGS",
+                                            severity="HIGH",
+                                            details=(
+                                                f"Spawned {child_process} with unusual arguments "
+                                                f"(similarity: {max_similarity:.2f})"
+                                            ),
+                                            row=row,
+                                            baseline=baseline,
+                                            normalized_args=normalized_args,
+                                            occurrence_count=occurrence_count,
+                                            confidence_score=spawn_confidence,
+                                            baseline_context={
+                                                "status": "ACTIVE_DETECTION",
+                                                "reason": "SPAWNED_PROCESS_UNUSUAL_ARGS"
+                                            },
+                                            extra={
+                                                "child_process": child_process,
+                                                "child_normalized_args": child_args_norm,
+                                                "child_actual_args": str(child_args)[:200] if child_args else "",
+                                                "similarity_score": f"{max_similarity:.2f}",
+                                                "most_similar_baseline": (
+                                                    str(best_baseline_arg)[:100]
+                                                    if best_baseline_arg else ""
+                                                )
+                                            }
+                                        )
+                                    )
 
                 if anomalies:
                     max_confidence = max(a.get('confidence_score', 0.0) for a in anomalies)
@@ -1754,417 +1787,9 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
         print("✅ No anomalies")
         return pd.DataFrame()
     
-    
-    def detect_anomalies_old(self, df_process, df_children, baselines, min_occurrences=3):
-        """Detect anomalies using statistical models"""
-        print(f"\n🔍 Detecting anomalies with statistical models...")
-        
-        if df_process is None or len(df_process) == 0:
-            print("⚠️ No process data")
-            return pd.DataFrame()
-    
-        if not baselines:
-            print("⚠️ No baselines")
-            return pd.DataFrame()
-        
-        all_alerts = []
-        matched_keys = 0
-        unmatched_keys = 0
-        
-        try:
-            for _, row in df_process.iterrows():
-                normalized_args = self._normalize_process_args(row.get('ProcessArgs'))
-                user = row.get('UserName', 'UNKNOWN')
-                signer = self._normalize_signer(row.get('ProcessSigner'))
-                key = (row['MachineName'], row['ProcessName'], normalized_args, signer)
-                
-                # Check signer change
-                same_triplet_signers = [
-                    k[3] for k in baselines.keys()
-                    if k[0] == row['MachineName'] and k[1] == row['ProcessName'] and k[2] == normalized_args
-                ]
 
-                if same_triplet_signers and signer not in same_triplet_signers:
-                    severity = SEVERITY_THRESHOLDS.get("signer_changed_default", "HIGH")
-                    if signer.upper() in ("UNKNOWN", "UNSIGNED", "N/A", "ERR:NOT-REPORTED"):
-                        severity = SEVERITY_THRESHOLDS.get("signer_changed_if_unsigned", "MEDIUM")
 
-                    event_time = row.get('CreationTime')
-                    alert_timestamp = str(int(event_time)) if event_time and pd.notna(event_time) else "UNKNOWN"
 
-                    all_alerts.append({
-                        "timestamp": alert_timestamp,
-                        "machine": row["MachineName"],
-                        "process": row["ProcessName"],
-                        "pid": int(row["Pid"]) if pd.notna(row["Pid"]) else 0,
-                        "user": user,
-                        "signer": signer,
-                        "process_args": str(row.get("ProcessArgs", ""))[:200],
-                        "anomaly_count": 1,
-                        "max_confidence_score": 0.95,
-                        "baseline_context": {
-                            "status": "SIGNER_CHANGED"
-                        },
-                        'anomalies': [
-                            self._make_anomaly(
-                                type="ALERT_PROCESS_SIGNER_CHANGED",
-                                severity=severity,
-                                details=f"Signer changed: '{signer}' not in baseline",
-                                row=row,
-                                baseline=None,
-                                normalized_args=normalized_args,
-                                occurrence_count=0,
-                                confidence_score=0.95,
-                                extra={"current_signer": signer, "baseline_signers": list(set(same_triplet_signers))[:10]}
-                            )
-                        ]
-                    })
-                    continue
-                
-                if key not in baselines:
-                    unmatched_keys += 1
-                    similar_processes = [k for k in baselines.keys() if k[1] == row['ProcessName']]
-                    confidence = 0.8 if similar_processes else 1.0
-                    
-                    event_time = row.get('CreationTime')
-                    alert_timestamp = str(int(event_time)) if event_time and pd.notna(event_time) else "UNKNOWN"
-                    
-                    all_alerts.append({
-                        'timestamp': alert_timestamp,
-                        'machine': row['MachineName'],
-                        'process': row['ProcessName'],
-                        'pid': int(row['Pid']) if pd.notna(row['Pid']) else 0,
-                        'user': user,
-                        'signer': signer,
-                        'process_args': str(row.get('ProcessArgs', ''))[:200],
-                        'anomaly_count': 1,
-                        'max_confidence_score': confidence,
-                        'anomalies': [
-                            self._make_anomaly(
-                                type="ALERT_NEW_AI_AGENT_NOT_IN_BASELINE",
-                                severity="LOW",
-                                details=f"AI agent not in baseline: {row['ProcessName']}",
-                                row=row,
-                                baseline=None,
-                                normalized_args=normalized_args,
-                                occurrence_count=0,
-                                confidence_score=confidence
-                            )
-                        ]
-                    })
-                    continue
-         
-                baseline = baselines[key]
-                occurrence_count = baseline.get('occurrence_count', 0)
-                
-                if occurrence_count < min_occurrences:
-                    event_time = row.get('CreationTime')
-                    alert_timestamp = str(int(event_time)) if event_time and pd.notna(event_time) else "UNKNOWN"
-                    learning_confidence = occurrence_count / min_occurrences
-                    
-                    all_alerts.append({
-                        'timestamp': alert_timestamp,
-                        'machine': row['MachineName'],
-                        'process': row['ProcessName'],
-                        'pid': int(row['Pid']) if pd.notna(row['Pid']) else 0,
-                        'user': user,
-                        'signer': signer,
-                        'process_args': str(row.get('ProcessArgs', ''))[:200],
-                        'anomaly_count': 1,
-                        'max_confidence_score': learning_confidence,
-                        'anomalies': [
-                            self._make_anomaly(
-                                type="ALERT_AI_AGENT_IN_LEARNING_PHASE",
-                                severity="INFO",
-                                details=f"Learning: {row['ProcessName']} seen {occurrence_count}/{min_occurrences}",
-                                row=row,
-                                baseline=baseline,
-                                normalized_args=normalized_args,
-                                occurrence_count=occurrence_count,
-                                confidence_score=learning_confidence
-                            )
-                        ]
-                    })
-                    continue
-                
-                matched_keys += 1
-                anomalies = []
-                
-                event_time = row.get('CreationTime')
-                alert_timestamp = str(int(event_time)) if event_time and pd.notna(event_time) else "UNKNOWN"
-                
-                # USER CHECK
-                baseline_users = baseline.get('users', set())
-                if user not in baseline_users:
-                    user_confidence = 1.0 if len(baseline_users) > 0 else 0.5
-                    
-                    anomalies.append(
-                        self._make_anomaly(
-                            type="ALERT_NEW_USER_FOR_PROCESS",
-                            severity="HIGH",
-                            details=f"NEW user: {user}",
-                            row=row,
-                            baseline=baseline,
-                            normalized_args=normalized_args,
-                            occurrence_count=occurrence_count,
-                            confidence_score=user_confidence,
-                            extra={"current_user": user, "baseline_users": list(baseline_users)[:10]}
-                        )
-                    )
-                
-                # NEW DOMAINS (adaptive threshold)
-                domains_raw = row.get('contacted_domains')
-                current_domains = clean_set(self._safe_parse_list(domains_raw))
-                baseline_domains = baseline.get('contacted_domains', set())
-                
-                domain_threshold = self.stats_helper.adaptive_threshold(baseline_domains, 0.90)
-                
-                truly_new_domains = []
-                domain_confidences = []
-                for domain in current_domains:
-                    is_novel, confidence, match = self.stats_helper.novelty_score(domain, baseline_domains, domain_threshold)
-                    if is_novel:
-                        truly_new_domains.append(domain)
-                        domain_confidences.append(confidence)
-                
-                if truly_new_domains:
-                    avg_confidence = np.mean(domain_confidences) if domain_confidences else 0.8
-                    severity = "HIGH" if len(truly_new_domains) >= SEVERITY_THRESHOLDS.get("new_domains_high", 5) else "MEDIUM"
-                    
-                    anomalies.append(self._make_anomaly(
-                        type="ALERT_NEW_DOMAINS",
-                        severity=severity,
-                        details=f"{len(truly_new_domains)} new domains",
-                        row=row,
-                        baseline=baseline,
-                        normalized_args=normalized_args,
-                        occurrence_count=occurrence_count,
-                        confidence_score=float(avg_confidence),
-                        extra={"new_domains": truly_new_domains[:10]}
-                    ))
-                
-                # EXCESSIVE TRANSFER (Z-score)
-                bytes_sent = row.get('NetworkBytesSent_sum', 0)
-                mean_sent = baseline['stats'].get('bytes_sent_mean', 0)
-                std_sent = baseline['stats'].get('bytes_sent_std', 0)
-                p99_sent = baseline['stats'].get('bytes_sent_p99', 0)
-                
-                if mean_sent > 0 and std_sent > 0:
-                    z_score = self.stats_helper.calculate_z_score(bytes_sent, mean_sent, std_sent)
-                    
-                    if z_score > 3.0:
-                        confidence = self.stats_helper.z_score_to_confidence(z_score, 6.0)
-                        severity = "CRITICAL" if bytes_sent > p99_sent else "HIGH"
-                        
-                        anomalies.append(
-                            self._make_anomaly(
-                                type="ALERT_EXCESSIVE_TRANSFER",
-                                severity=severity,
-                                details=f"Sent {bytes_sent/1e6:.1f}MB (z={z_score:.1f})",
-                                row=row,
-                                baseline=baseline,
-                                normalized_args=normalized_args,
-                                occurrence_count=occurrence_count,
-                                confidence_score=float(confidence),
-                                extra={"z_score": f"{z_score:.2f}", "bytes_sent": int(bytes_sent)}
-                            )
-                        )
-                
-                # NEW DIRECTORIES (adaptive)
-                dirs_raw = row.get('accessed_dirs')
-                dirs_list = self._safe_parse_list(dirs_raw)
-                current_dirs = set(self._normalize_directory_path(d) for d in dirs_list if d)
-                baseline_dirs = set(self._normalize_directory_path(d) for d in baseline.get('accessed_dirs', set()))
-                
-                IGNORE_DIRS = {'appdata\\local\\temp', '/tmp'}
-                dir_threshold = self.stats_helper.adaptive_threshold(baseline_dirs, 0.85)
-                
-                truly_new_dirs = []
-                dir_confidences = []
-                for curr_dir in current_dirs:
-                    if any(p in curr_dir.lower() for p in IGNORE_DIRS):
-                        continue
-                    is_novel, confidence, match = self.stats_helper.novelty_score(curr_dir, baseline_dirs, dir_threshold)
-                    if is_novel:
-                        truly_new_dirs.append(curr_dir)
-                        dir_confidences.append(confidence)
-                
-                if truly_new_dirs:
-                    avg_confidence = np.mean(dir_confidences) if dir_confidences else 0.7
-                    anomalies.append(
-                        self._make_anomaly(
-                            type="ALERT_NEW_DIRECTORIES",
-                            severity="MEDIUM",
-                            details=f"{len(truly_new_dirs)} new directories",
-                            row=row,
-                            baseline=baseline,
-                            normalized_args=normalized_args,
-                            occurrence_count=occurrence_count,
-                            confidence_score=float(avg_confidence),
-                            extra={"new_directories": truly_new_dirs[:10]}
-                        )
-                    )
-                
-                # NEW IPS
-                ips_raw = row.get('contacted_ips')
-                current_ips = set(ip for ip in self._safe_parse_list(ips_raw) if ip and str(ip).strip())
-                baseline_ips = baseline.get('contacted_ips', set())
-                
-                new_ips = current_ips - baseline_ips
-                if new_ips:
-                    ip_confidence = 1.0 if len(baseline_ips) > 0 else 0.8
-                    anomalies.append(
-                        self._make_anomaly(
-                            type="ALERT_NEW_IPS",
-                            severity="HIGH",
-                            details=f"{len(new_ips)} new IP(s)",
-                            row=row,
-                            baseline=baseline,
-                            normalized_args=normalized_args,
-                            occurrence_count=occurrence_count,
-                            confidence_score=ip_confidence,
-                            extra={"new_ips": list(new_ips)[:10]}
-                        )
-                    )
-                
-                # NEW PORTS
-                ports_raw = row.get('contacted_ports')
-                current_ports = set(str(p) for p in self._safe_parse_list(ports_raw) if p and str(p).strip())
-                baseline_ports = baseline.get('contacted_ports', set())
-                
-                new_ports = current_ports - baseline_ports
-                if new_ports:
-                    port_confidence = 0.7
-                    severity = "MEDIUM" if len(new_ports) >= SEVERITY_THRESHOLDS.get("new_ports_medium", 3) else "LOW"
-                    
-                    anomalies.append(
-                        self._make_anomaly(
-                            type="ALERT_NEW_PORTS",
-                            severity=severity,
-                            details=f"{len(new_ports)} new port(s)",
-                            row=row,
-                            baseline=baseline,
-                            normalized_args=normalized_args,
-                            occurrence_count=occurrence_count,
-                            confidence_score=port_confidence,
-                            extra={"new_ports": list(new_ports)[:10]}
-                        )
-                    )
-                
-                # [Continue with remaining detection types...]
-                # MODEL FILE MODIFICATIONS
-                mod_files_raw = row.get('modified_model_files')
-                modified_raw = [f for f in self._safe_parse_list(mod_files_raw) if f]
-                modified = {self._normalize_filename(f): f for f in modified_raw}
-                
-                mod_details_raw = row.get('file_mod_details')
-                mod_details = self._safe_parse_list(mod_details_raw)
-                baseline_file_ops = baseline.get('file_operations', {})
-                
-                for norm_file, original_file in modified.items():
-                    file_mod_info = None
-                    for detail in mod_details:
-                        if detail.get('file') == original_file:
-                            file_mod_info = detail
-                            break
-                    
-                    mod_user = file_mod_info.get('user') if file_mod_info else None
-                    
-                    file_in_baseline = False
-                    for baseline_file in baseline_file_ops.keys():
-                        if SequenceMatcher(None, norm_file.lower(), baseline_file.lower()).ratio() >= 0.90:
-                            file_in_baseline = True
-                            break
-                    
-                    if not file_in_baseline:
-                        anomalies.append(
-                            self._make_anomaly(
-                                type="ALERT_NEW_MODEL_FILE_MODIFICATION",
-                                severity="CRITICAL",
-                                details=f"FIRST TIME: {original_file}",
-                                row=row,
-                                baseline=baseline,
-                                normalized_args=normalized_args,
-                                occurrence_count=occurrence_count,
-                                confidence_score=0.98,
-                                extra={"file": original_file}
-                            )
-                        )
-                
-                # CHILD SPAWNING
-                children_of_this = df_children[
-                    (df_children['MachineName'] == row['MachineName']) &
-                    (df_children['ProcessPPidCreationTime'] == row['PidCreationTime'])
-                ]
-
-                baseline_spawned = baseline.get('spawned_with_args', set())
-
-                for _, child in children_of_this.iterrows():
-                    child_process = child.get('ProcessName')
-                    if not child_process or not str(child_process).strip():
-                        continue
-                    
-                    child_args_norm = self._normalize_process_args(child.get('ProcessArgs'))
-                    exact_match = (child_process, child_args_norm) in baseline_spawned
-                    
-                    if not exact_match:
-                        baseline_args = [args for proc, args in baseline_spawned if proc == child_process]
-                            
-                        if not baseline_args:
-                            anomalies.append(
-                                self._make_anomaly(
-                                    type="ALERT_NEW_SPAWNED_PROCESS",
-                                    severity="CRITICAL",
-                                    details=f"Never spawned: {child_process}",
-                                    row=row,
-                                    baseline=baseline,
-                                    normalized_args=normalized_args,
-                                    occurrence_count=occurrence_count,
-                                    confidence_score=0.95,
-                                    extra={"child_process": child_process}
-                                )
-                            )
-
-                if anomalies:
-                    max_confidence = max(a.get('confidence_score', 0.0) for a in anomalies)
-                    
-                    all_alerts.append({
-                        'timestamp': alert_timestamp,
-                        'machine': row['MachineName'],
-                        'process': row['ProcessName'],
-                        'pid': int(row['Pid']) if pd.notna(row['Pid']) else 0,
-                        'user': user,
-                        'signer': signer,
-                        'process_args': str(row.get('ProcessArgs', ''))[:200],
-                        'anomaly_count': len(anomalies),
-                        'max_confidence_score': float(max_confidence),
-                        'baseline_context': {
-                            'status': 'ACTIVE_DETECTION',
-                            'occurrence_count': occurrence_count
-                        },
-                        'anomalies': anomalies
-                    })
-        
-        except Exception as e:
-            print(f"❌ Error: {e}")
-            import traceback
-            traceback.print_exc()
-            if all_alerts:
-                return pd.DataFrame(all_alerts)
-            return pd.DataFrame()
-        
-        print(f"\n📊 Summary: {matched_keys + unmatched_keys} checked, {matched_keys} matched, {unmatched_keys} new")
-              
-        if all_alerts:
-            print(f"🚨 {len(all_alerts)} alerts")
-            confidences = [a.get('max_confidence_score', 0) for a in all_alerts]
-            if confidences:
-                print(f"  📈 Confidence: {min(confidences):.2f}-{max(confidences):.2f}, avg: {np.mean(confidences):.2f}")
-            return pd.DataFrame(all_alerts)
-        
-        print("✅ No anomalies")
-        return pd.DataFrame()
-    
     def save_alerts(self, alerts_df):
         """Save alerts with confidence scores"""
         if len(alerts_df) == 0:
@@ -2449,6 +2074,9 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
             baseline['network_paths'].update(new_data['network_paths'])
             baseline['accessed_files'].update(new_data['accessed_files'])
             baseline['accessed_extensions'].update(new_data['accessed_extensions'])
+            # In merge_baselines(), with other set merges:
+            baseline['process_dirs'] = baseline.get('process_dirs', set())
+            baseline['process_dirs'].update(new_data.get('process_dirs', set()))
             
             # Merge file operations
             for fname, fdata in new_data.get('file_operations', {}).items():
@@ -2636,308 +2264,6 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
     
     
     
-    
-    
-    def merge_baselines_with_frequency_and_decay_old(
-                                                self, 
-                                                existing_baseline, 
-                                                new_process_data, 
-                                                new_children_data,
-                                                min_occurrences=3,# Lower = more permissive, Higher = stricter
-                                                                        # 3 = Good balance for daily updates
-                                                decay_days=30, # Directories/domains not seen in 30 days are removed
-                                                                        # Shorter = cleaner baseline, Longer = fewer false positive
-                                                critical_items_decay_days=90
-                                                ):
-        """
-        Merge new data into baseline with:
-        1. Frequency threshold: Items must appear N times to be added
-        2. Time-based decay: Items not seen in X days are removed
-        
-        Args:
-            existing_baseline: Current baseline dict
-            new_process_data: List of process DataFrames
-            new_children_data: List of children DataFrames
-            min_occurrences: Minimum times item must appear to be added
-            decay_days: Days after which directories/domains expire
-            critical_items_decay_days: Days for critical items (file_operations, spawned processes)
-        """
-        print(f"\n🔄 Merging baselines:")
-        print(f"  📊 Frequency threshold: {min_occurrences} occurrences")
-        print(f"  ⏰ Decay period: {decay_days} days (critical items: {critical_items_decay_days} days)")
-        
-        current_date = self._get_current_date()
-        
-        
-
-        # Build new baseline from recent data
-        new_baseline = self.build_baseline(new_process_data, new_children_data)
-        
-        # Combine all process data for frequency counting
-        all_process_df = pd.concat(new_process_data, ignore_index=True) if new_process_data else pd.DataFrame()
-        
-        stats = {
-            'new_keys': 0,
-            'expired_dirs': 0,
-            'expired_domains': 0,
-            'expired_file_ops': 0,
-            'added_dirs': 0,
-            'added_domains': 0,
-            'skipped_rare_dirs': 0,
-            'skipped_rare_domains': 0
-        }
-        
-        # Process each key in new baseline
-        for key, new_data in new_baseline.items():
-            if key not in existing_baseline:
-                # Brand new process combination - add with metadata
-                existing_baseline[key] = new_data
-                
-                # Initialize occurrence_count to 1 (first time seeing this combination)
-                existing_baseline[key]['occurrence_count'] = 1
-                
-                # Initialize metadata for all items
-                existing_baseline[key]['accessed_dirs_meta'] = {
-                    d: {'first_seen': current_date, 'last_seen': current_date, 'count': 1}
-                    for d in new_data['accessed_dirs']
-                }
-                existing_baseline[key]['contacted_domains_meta'] = {
-                    d: {'first_seen': current_date, 'last_seen': current_date, 'count': 1}
-                    for d in new_data['contacted_domains']
-                }
-                existing_baseline[key]['file_operations_meta'] = {
-                    fname: {'first_seen': current_date, 'last_seen': current_date}
-                    for fname in new_data.get('file_operations', {}).keys()
-                }
-                
-                stats['new_keys'] += 1
-                print(f"  ✨ New (learning): {key[1]} (signer: {key[3]}) on {key[0]} - occurrence 1/{min_occurrences}")
-                continue
-            
-            # Existing key - merge with frequency filtering and decay
-            baseline = existing_baseline[key]
-            baseline['occurrence_count'] = baseline.get('occurrence_count', 0) + 1            
-    
-            current_count = baseline['occurrence_count']
-            if current_count == min_occurrences:
-                print(f"  🎯 Promoted to active detection: {key[1]} on {key[0]} (reached {min_occurrences} occurrences)")
-    
-            
-            # Initialize metadata dicts if they don't exist (backward compatibility)
-            if 'accessed_dirs_meta' not in baseline:
-                baseline['accessed_dirs_meta'] = {
-                    d: {'first_seen': current_date, 'last_seen': current_date, 'count': 1}
-                    for d in baseline['accessed_dirs']
-                }
-            if 'contacted_domains_meta' not in baseline:
-                baseline['contacted_domains_meta'] = {
-                    d: {'first_seen': current_date, 'last_seen': current_date, 'count': 1}
-                    for d in baseline['contacted_domains']
-                }
-            if 'file_operations_meta' not in baseline:
-                baseline['file_operations_meta'] = {
-                    fname: {'first_seen': current_date, 'last_seen': current_date}
-                    for fname in baseline.get('file_operations', {}).keys()
-                }
-            for d in list(baseline.get('accessed_dirs', set())):
-                baseline['accessed_dirs_meta'].setdefault(d, {
-                    'first_seen': current_date,
-                    'last_seen': current_date,
-                    'count': 1
-                })
-
-            for dom in list(baseline.get('contacted_domains', set())):
-                baseline['contacted_domains_meta'].setdefault(dom, {
-                    'first_seen': current_date,
-                    'last_seen': current_date,
-                    'count': 1
-                })
-                
-            # Repair missing file_operations_meta entries (handles partial meta dicts)
-            baseline.setdefault('file_operations_meta', {})
-            for fname in list(baseline.get('file_operations', {}).keys()):
-                baseline['file_operations_meta'].setdefault(fname, {
-                    'first_seen': current_date,
-                    'last_seen': current_date
-                })
-
-            # --- Repair partial meta dicts (prevents KeyError drift) ---
-            baseline.setdefault('accessed_dirs_meta', {})
-            for d in list(baseline.get('accessed_dirs', set())):
-                baseline['accessed_dirs_meta'].setdefault(d, {'first_seen': current_date, 'last_seen': current_date, 'count': 1})
-
-            baseline.setdefault('contacted_domains_meta', {})
-            for dom in list(baseline.get('contacted_domains', set())):
-                baseline['contacted_domains_meta'].setdefault(dom, {'first_seen': current_date, 'last_seen': current_date, 'count': 1})
-
-            baseline.setdefault('file_operations_meta', {})
-            for fname in list(baseline.get('file_operations', {}).keys()):
-                baseline['file_operations_meta'].setdefault(fname, {'first_seen': current_date, 'last_seen': current_date})
-
-
-
-            # === DECAY: Remove old items ===
-            # Remove expired directories
-            expired_dirs = []
-            for dir_path, meta in list(baseline['accessed_dirs_meta'].items()):
-                days = self._days_since(meta['last_seen'])
-                if days > decay_days:
-                    expired_dirs.append(dir_path)
-                    baseline['accessed_dirs'].discard(dir_path)
-                    del baseline['accessed_dirs_meta'][dir_path]
-                    stats['expired_dirs'] += 1
-            
-            if expired_dirs:
-                print(f"  🗑️ Expired {len(expired_dirs)} old directories for {key[1]}")
-            
-            # Remove expired domains
-            expired_domains = []
-            for domain, meta in list(baseline['contacted_domains_meta'].items()):
-                days = self._days_since(meta['last_seen'])
-                if days > decay_days:
-                    expired_domains.append(domain)
-                    baseline['contacted_domains'].discard(domain)
-                    del baseline['contacted_domains_meta'][domain]
-                    stats['expired_domains'] += 1
-            
-            if expired_domains:
-                print(f"  🗑️ Expired {len(expired_domains)} old domains for {key[1]}")
-            
-            # Remove expired file operations (longer decay period)
-            expired_files = []
-            for fname, meta in list(baseline.get('file_operations_meta', {}).items()):
-                days = self._days_since(meta['last_seen'])
-                if days > critical_items_decay_days:
-                    expired_files.append(fname)
-                    baseline['file_operations'].pop(fname, None)
-                    del baseline['file_operations_meta'][fname]
-                    stats['expired_file_ops'] += 1
-            
-            if expired_files:
-                print(f"  🗑️ Expired {len(expired_files)} old file operations for {key[1]}")
-            
-            # === FREQUENCY FILTERING: Count occurrences in new data ===
-            if len(all_process_df) > 0:
-                normalized_args, signer = key[2], key[3]
-                matching_rows = all_process_df[
-                    (all_process_df['MachineName'] == key[0]) & 
-                    (all_process_df['ProcessName'] == key[1]) &
-                    (all_process_df['ProcessSigner'].apply(lambda x: self._normalize_signer(x)) == signer) &
-                    (all_process_df['ProcessArgs'].apply(lambda x: self._normalize_process_args(x)) == normalized_args)
-                ]
-                
-                # Count directory frequencies
-                dir_counts = {}
-                for _, row in matching_rows.iterrows():
-                    dirs = self._safe_parse_list(row.get('accessed_dirs'))
-                    for d in dirs:
-                        norm_dir = self._normalize_directory_path(d)
-                        if norm_dir:
-                            dir_counts[norm_dir] = dir_counts.get(norm_dir, 0) + 1
-                
-                # Add or update directories
-                for norm_dir, count in dir_counts.items():
-                    if norm_dir in baseline['accessed_dirs']:
-                        baseline['accessed_dirs_meta'].setdefault(norm_dir, {
-                            'first_seen': current_date,
-                            'last_seen': current_date,
-                            'count': 0
-                        })
-                        baseline['accessed_dirs_meta'][norm_dir]['last_seen'] = current_date
-                        baseline['accessed_dirs_meta'][norm_dir]['count'] = baseline['accessed_dirs_meta'][norm_dir].get('count', 0) + count
-                    elif count >= min_occurrences:
-                        # New and frequent enough - add it
-                        baseline['accessed_dirs'].add(norm_dir)
-                        baseline['accessed_dirs_meta'][norm_dir] = {
-                            'first_seen': current_date,
-                            'last_seen': current_date,
-                            'count': count
-                        }
-                        stats['added_dirs'] += 1
-                    else:
-                        # Too rare - skip
-                        stats['skipped_rare_dirs'] += 1
-                
-                # Count domain frequencies
-                domain_counts = {}
-                for _, row in matching_rows.iterrows():
-                    domains = self._safe_parse_list(row.get('contacted_domains'))
-                    for d in domains:
-                        if d and str(d).strip():
-                            domain_counts[d] = domain_counts.get(d, 0) + 1
-                
-                # Add or update domains
-                for domain, count in domain_counts.items():
-                    if domain in baseline['contacted_domains']:
-                        baseline['contacted_domains_meta'].setdefault(domain, {
-                            'first_seen': current_date,
-                            'last_seen': current_date,
-                            'count': 0
-                        })
-                        baseline['contacted_domains_meta'][domain]['last_seen'] = current_date
-                        baseline['contacted_domains_meta'][domain]['count'] = baseline['contacted_domains_meta'][domain].get('count', 0) + count
-                    elif count >= min_occurrences:
-                        # New and frequent enough - add it
-                        baseline['contacted_domains'].add(domain)
-                        baseline['contacted_domains_meta'][domain] = {
-                            'first_seen': current_date,
-                            'last_seen': current_date,
-                            'count': count
-                        }
-                        stats['added_domains'] += 1
-                    else:
-                        # Too rare - skip
-                        stats['skipped_rare_domains'] += 1
-            
-            # === Merge other items (less risky, no frequency threshold) ===
-            # Always merge: spawned processes, users
-            baseline['spawned_processes'].update(new_data['spawned_processes'])
-            baseline['spawned_with_args'].update(new_data['spawned_with_args'])
-            baseline['spawned_args'].update(new_data['spawned_args'])
-            baseline['users'].update(new_data['users'])
-            baseline['process_args'].update(new_data['process_args'])
-            
-            # Merge: IPs, ports, paths, files, extensions (less security-critical)
-            baseline['contacted_ips'].update(new_data['contacted_ips'])
-            baseline['contacted_ports'].update(new_data['contacted_ports'])
-            baseline['network_paths'].update(new_data['network_paths'])
-            baseline['accessed_files'].update(new_data['accessed_files'])
-            baseline['accessed_extensions'].update(new_data['accessed_extensions'])
-            
-            # Merge file operations and update metadata
-            for fname, fdata in new_data.get('file_operations', {}).items():
-                if fname in baseline['file_operations']:
-                    baseline['file_operations'][fname]['operations'].update(fdata['operations'])
-                    baseline['file_operations'][fname]['users'].update(fdata['users'])
-                    baseline['file_operations'][fname]['process_args'].update(fdata['process_args'])
-                    baseline['file_operations_meta'].setdefault(fname, {
-                        'first_seen': current_date,
-                        'last_seen': current_date
-                    })
-                    baseline['file_operations_meta'][fname]['last_seen'] = current_date
-                else:
-                    baseline['file_operations'][fname] = fdata
-                    baseline['file_operations_meta'][fname] = {
-                        'first_seen': current_date,
-                        'last_seen': current_date
-                    }
-            
-            # Update stats
-            baseline['stats']['instances'] += new_data['stats']['instances']
-        
-        # Print summary
-        print(f"\n📈 Merge Summary:")
-        print(f"  ✨ New process combinations: {stats['new_keys']}")
-        print(f"  ➕ Added directories: {stats['added_dirs']}")
-        print(f"  ➕ Added domains: {stats['added_domains']}")
-        print(f"  ⏭️ Skipped rare directories: {stats['skipped_rare_dirs']}")
-        print(f"  ⏭️ Skipped rare domains: {stats['skipped_rare_domains']}")
-        print(f"  🗑️ Expired directories: {stats['expired_dirs']}")
-        print(f"  🗑️ Expired domains: {stats['expired_domains']}")
-        print(f"  🗑️ Expired file operations: {stats['expired_file_ops']}")
-        
-        return existing_baseline                                                  
-
 
 
 def execute(cluster, database, tenant, output_dir, mode, lookback_unit='day', 
