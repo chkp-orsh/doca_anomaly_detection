@@ -246,13 +246,18 @@ ALERT_CLASSIFICATION = {
         "ai_risk": ["Binary Integrity", "Execution Trust Change"],
         "confidence": "High",
     },
+    "ALERT_PROCESS_RUNNING_FROM_NEW_LOCATION": {
+    "mitre": ["T1036.005 - Match Legitimate Name or Location"],
+    "ai_risk": ["Process Impersonation", "DLL Side-Loading"],
+    "confidence": "High"
+    },
 }
 
 # ============================================================
 # SOC RUNBOOKS PER ALERT TYPE
 # ============================================================
 ALERT_RUNBOOKS = {
-    "ALERT_NEW_AI_AGENT_NOT_IN_BASELINE": {
+    "EVENT_NEW_AI_AGENT_NOT_IN_BASELINE": {
         "summary": "New AI-related process detected that has no prior baseline.",
         "triage": [
             "Confirm whether AI usage is expected on this host",
@@ -269,7 +274,7 @@ ALERT_RUNBOOKS = {
             "Escalate if unauthorized or unexpected",
         ],
     },
-    "ALERT_AI_AGENT_IN_LEARNING_PHASE": {
+    "LOG_AI_AGENT_IN_LEARNING_PHASE": {
         "summary": "AI process is still learning baseline behavior.",
         "triage": ["No immediate action unless other anomalies exist."],
         "investigation": ["Monitor until learning completes."],
@@ -380,6 +385,26 @@ ALERT_RUNBOOKS = {
         "investigation": ["Verify file hash, path, and install/update source"],
         "response": ["Escalate if signer downgrade or unexpected publisher"],
     },
+    "ALERT_PROCESS_RUNNING_FROM_NEW_LOCATION": {
+    "summary": "AI process running from unexpected directory location",
+    "triage": [
+        "Verify the process path is legitimate for this application",
+        "Check if process is running from temp/downloads/suspicious location",
+        "Compare process signer and user against baseline"
+    ],
+    "investigation": [
+        "Review process command line arguments for suspicious patterns",
+        "Check parent process and process tree",
+        "Examine file system timeline around process creation",
+        "Look for file copies or moves to this location"
+    ],
+    "response": [
+        "If unauthorized: Kill process and quarantine executable",
+        "Scan executable with AV/EDR",
+        "Check for lateral movement from this host",
+        "Review user account for compromise indicators"
+    ]
+}
 }
 
 __all__ = ["ALERT_CLASSIFICATION", "ALERT_RUNBOOKS"]
