@@ -161,7 +161,174 @@ __all__ = [
 # ============================================================
 # MITRE ATT&CK + AI Risk Taxonomy Mapping
 # ============================================================
+# In ai_anomaly_defs.py - ALERT_CLASSIFICATION dict:
+
 ALERT_CLASSIFICATION = {
+    "ALERT_PROCESS_SIGNER_CHANGED": {
+        "mitre": [
+            "T1036.001 - Invalid Code Signature",
+            "T1036.005 - Match Legitimate Name or Location",
+            "T1553.002 - Code Signing"
+        ],
+        "ai_risk": ["Process Impersonation", "Supply Chain Attack"],
+        "confidence": "High"
+    },
+    
+    "ALERT_NEW_AI_AGENT_NOT_IN_BASELINE": {
+        "mitre": [
+            "T1204.002 - User Execution: Malicious File",
+            "T1543 - Create or Modify System Process"
+        ],
+        "ai_risk": ["Unauthorized AI Deployment", "Shadow AI"],
+        "confidence": "Medium"
+    },
+    
+    "ALERT_AI_AGENT_IN_LEARNING_PHASE": {
+        "mitre": [],
+        "ai_risk": ["New AI Agent - Learning"],
+        "confidence": "Info"
+    },
+    
+    "ALERT_NEW_USER_FOR_PROCESS": {
+        "mitre": [
+            "T1078 - Valid Accounts",
+            "T1078.003 - Local Accounts"
+        ],
+        "ai_risk": ["Credential Compromise", "Insider Threat"],
+        "confidence": "High"
+    },
+    
+    "ALERT_PROCESS_RUNNING_FROM_NEW_LOCATION": {
+        "mitre": [
+            "T1036.005 - Match Legitimate Name or Location",
+            "T1574.002 - DLL Side-Loading",
+            "T1218 - System Binary Proxy Execution"
+        ],
+        "ai_risk": ["Process Impersonation", "DLL Hijacking"],
+        "confidence": "High"
+    },
+    
+    "ALERT_NEW_DOMAINS": {
+        "mitre": [
+            "T1071.001 - Web Protocols",
+            "T1568 - Dynamic Resolution",
+            "T1041 - Exfiltration Over C2 Channel"
+        ],
+        "ai_risk": ["Command and Control", "Data Exfiltration"],
+        "confidence": "Medium"
+    },
+    
+    "ALERT_NEW_IPS": {
+        "mitre": [
+            "T1071 - Application Layer Protocol",
+            "T1041 - Exfiltration Over C2 Channel",
+            "T1090 - Proxy"
+        ],
+        "ai_risk": ["C2 Communication", "Data Exfiltration"],
+        "confidence": "High"
+    },
+    
+    "ALERT_NEW_PORTS": {
+        "mitre": [
+            "T1571 - Non-Standard Port",
+            "T1205 - Traffic Signaling"
+        ],
+        "ai_risk": ["Covert Channel", "Unauthorized Network Access"],
+        "confidence": "Low"
+    },
+    
+    "ALERT_NEW_DIRECTORIES": {
+        "mitre": [
+            "T1083 - File and Directory Discovery",
+            "T1005 - Data from Local System"
+        ],
+        "ai_risk": ["Data Discovery", "Reconnaissance"],
+        "confidence": "Low"
+    },
+    
+    "ALERT_EXCESSIVE_TRANSFER": {
+        "mitre": [
+            "T1020 - Automated Exfiltration",
+            "T1041 - Exfiltration Over C2 Channel",
+            "T1030 - Data Transfer Size Limits"
+        ],
+        "ai_risk": ["Model Exfiltration", "Training Data Theft"],
+        "confidence": "Critical"
+    },
+    
+    "ALERT_NEW_FILE_EXTENSIONS": {
+        "mitre": [
+            "T1083 - File and Directory Discovery",
+            "T1005 - Data from Local System"
+        ],
+        "ai_risk": ["Data Discovery", "Unusual File Access"],
+        "confidence": "Low"
+    },
+    
+    "ALERT_ACCESSING_MANY_NEW_FILES": {
+        "mitre": [
+            "T1005 - Data from Local System",
+            "T1039 - Data from Network Shared Drive",
+            "T1119 - Automated Collection"
+        ],
+        "ai_risk": ["Bulk Data Access", "Reconnaissance"],
+        "confidence": "Medium"
+    },
+    
+    "ALERT_NEW_MODEL_FILE_MODIFICATION": {
+        "mitre": [
+            "T1565.001 - Stored Data Manipulation",
+            "T1485 - Data Destruction",
+            "T1495 - Firmware Corruption"
+        ],
+        "ai_risk": ["Model Poisoning", "Model Tampering", "Backdoor Injection"],
+        "confidence": "Critical"
+    },
+    
+    "ALERT_MODEL_FILE_MODIFIED_BY_NEW_USER": {
+        "mitre": [
+            "T1565.001 - Stored Data Manipulation",
+            "T1078 - Valid Accounts",
+            "T1134 - Access Token Manipulation"
+        ],
+        "ai_risk": ["Unauthorized Model Access", "Insider Threat", "Credential Abuse"],
+        "confidence": "Critical"
+    },
+    
+    "ALERT_MODEL_FILE_MODIFIED_WITH_UNUSUAL_ARGS": {
+        "mitre": [
+            "T1565.001 - Stored Data Manipulation",
+            "T1059 - Command and Scripting Interpreter",
+            "T1204.002 - User Execution: Malicious File"
+        ],
+        "ai_risk": ["Model Tampering", "Malicious Retraining"],
+        "confidence": "High"
+    },
+    
+    "ALERT_NEW_SPAWNED_PROCESS": {
+        "mitre": [
+            "T1059 - Command and Scripting Interpreter",
+            "T1106 - Native API",
+            "T1543 - Create or Modify System Process"
+        ],
+        "ai_risk": ["Unauthorized Process Execution", "Privilege Escalation"],
+        "confidence": "Critical"
+    },
+    
+    "ALERT_SPAWNED_PROCESS_UNUSUAL_ARGS": {
+        "mitre": [
+            "T1059.001 - PowerShell",
+            "T1059.003 - Windows Command Shell",
+            "T1059.006 - Python",
+            "T1027 - Obfuscated Files or Information"
+        ],
+        "ai_risk": ["Malicious Command Execution", "Code Injection"],
+        "confidence": "High"
+    }
+}
+
+
+ALERT_CLASSIFICATION_OLD = {
     "ALERT_NEW_AI_AGENT_NOT_IN_BASELINE": {
         "mitre": ["T1059"],
         "ai_risk": ["Shadow AI", "Unauthorized AI Deployment"],
