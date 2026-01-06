@@ -141,6 +141,27 @@ def normalize_filename(filename):
     
     return filename.strip()
     
+def normalize_process_args_ef(args):
+    """Normalize process arguments by removing ephemeral values"""
+    if not args or not str(args).strip():
+        return ""
+    
+    normalized = str(args).strip()
+    
+    # Import patterns
+    from ai_anomaly_defs import EPHEMERAL_PATTERNS
+    import re
+    
+    # Apply ephemeral pattern masking
+    for pattern, replacement in EPHEMERAL_PATTERNS:
+        #normalized = re.sub(pattern, replacement, normalized, flags=re.IGNORECASE)
+        normalized = re.sub(pattern, replacement, normalized)  # No flags parameter
+    
+    # Existing normalization...
+    # (keep your existing path, PID, timestamp normalization)
+    
+    return normalized
+    
     
 def normalize_process_args( args):
     """Extract stable command pattern"""
@@ -164,7 +185,8 @@ def normalize_process_args( args):
     args = re.sub(r':\d{4,5}', ':<PORT>', args)
     args = re.sub(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', '<UUID>', args, flags=re.IGNORECASE)
     args = re.sub(r'0x[0-9a-f]+', '<HEX>', args, flags=re.IGNORECASE)
-
+    
+    args=normalize_process_args_ef(args)
     return args.strip()
     
 def normalize_directory_path( path):
@@ -273,3 +295,156 @@ def days_since( date_str):
         return (now - past).days
     except:
         return 999
+        
+
+def _normalize_spawned_process_name( name: str | None) -> str:
+    """Normalize spawned child process names that contain run-specific IDs.
+    Example: msib42.tmp / msi35c4.tmp -> msi*.tmp
+    """
+    if not name:
+        return ""
+    n = str(name).strip()
+    # common MSI temp binaries: msi<hex>.tmp (case-insensitive)
+    if re.match(r"^msi[0-9a-f]+\.tmp$", n, flags=re.IGNORECASE):
+        return "msi*.tmp"
+    return n.lower()
+
+import re
+from collections import Counter
+from typing import Optional, Tuple, Dict, Any, List
+
+
+def lcp(strings: List[str]) -> str:
+    """Longest common prefix."""
+    if not strings:
+        return ""
+    s1 = min(strings)
+    s2 = max(strings)
+    i = 0
+    while i < len(s1) and i < len(s2) and s1[i].lower() == s2[i].lower():
+        i += 1
+    return s1[:i]
+
+
+def lcsuffix(strings: List[str]) -> str:
+    """Longest common suffix."""
+    if not strings:
+        return ""
+    rev = [s[::-1] for s in strings]
+    return lcp(rev)[::-1]
+
+
+def looks_variable_token(token: str) -> bool:
+    """
+    Evidence the varying part is run-specific:
+    digits, hex, guid-ish, mixed alnum but not typical 'word'.
+    """
+    t = (token or "").strip()
+    if not t:
+        return False
+
+    if re.fullmatch(r"[0-9]+", t):  # running number
+        return True
+
+    if re.fullmatch(r"[0-9a-fA-F]+", t) and len(t) >= 3:  # hex-ish
+        return True
+
+    if re.fullmatch(r"[0-9a-fA-F-]{8,}", t):  # guid-ish / long id-ish
+        return True
+
+    # mixed alnum with high digit ratio
+    digits = sum(ch.isdigit() for ch in t)
+    if len(t) >= 6 and digits / len(t) >= 0.5:
+        return True
+
+    return False
+
+
+def try_learn_name_template(
+    names: List[str],
+    *,
+    min_total: int = 10,
+    min_distinct: int = 3,
+    min_prefix: int = 3,
+    min_suffix: int = 3,
+    min_coverage: float = 0.7,
+    require_same_extension: bool = True
+) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """
+    Learn a regex template from observed names, only if strongly supported.
+    Returns (regex_pattern, meta) or (None, None).
+    """
+    if not names:
+        return None, None
+
+    counts = Counter([n for n in names if n])
+    total = sum(counts.values())
+    distinct = len(counts)
+
+    if total < min_total or distinct < min_distinct:
+        return None, None
+
+    uniq = list(counts.keys())
+
+    if require_same_extension:
+        exts = {(n.rsplit(".", 1)[1].lower() if "." in n else "") for n in uniq}
+        if len(exts) > 1:
+            return None, None
+
+    prefix = lcp(uniq)
+    suffix = lcsuffix(uniq)
+
+    # safety: avoid overly broad templates
+    if len(prefix) < min_prefix or len(suffix) < min_suffix:
+        return None, None
+    if len(prefix) + len(suffix) >= min(len(u) for u in uniq):
+        return None, None
+
+    good = 0
+    covered = 0
+
+    for n, c in counts.items():
+        n_low = n.lower()
+        if not (n_low.startswith(prefix.lower()) and n_low.endswith(suffix.lower())):
+            continue
+        mid = n[len(prefix):len(n) - len(suffix)]
+        covered += c
+        if looks_variable_token(mid):
+            good += c
+
+    if covered == 0:
+        return None, None
+
+    variable_ratio = good / covered
+    coverage_ratio = covered / total
+
+    if coverage_ratio < min_coverage or variable_ratio < 0.8:
+        return None, None
+
+    # Constrained variable token; adjust char-class if needed
+    pattern = r"(?i)^" + re.escape(prefix) + r"[0-9a-zA-Z-]{1,64}" + re.escape(suffix) + r"$"
+
+    meta = {
+        "prefix": prefix,
+        "suffix": suffix,
+        "total": total,
+        "distinct": distinct,
+        "coverage_ratio": coverage_ratio,
+        "variable_ratio": variable_ratio,
+    }
+    return pattern, meta
+
+
+def match_any_template(name: str, templates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Return the template dict that matches `name`, or None.
+    Expected template format: {"pattern": "<regex>", "meta": {...}}
+    """
+    n = (name or "").strip()
+    if not n:
+        return None
+    for t in templates or []:
+        pat = t.get("pattern")
+        if pat and re.match(pat, n):
+            return t
+    return None

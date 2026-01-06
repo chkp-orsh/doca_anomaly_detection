@@ -6,6 +6,54 @@ from __future__ import annotations
 
 import re
 
+# Whitelist patterns for known-good child spawning
+WHITELISTED_CHILD_PATTERNS = [
+    {
+        'parent_process': 'python2.7',
+        'child_process': 'curl',
+        'arg_contains': ['169.254.169.254', 'metadata'],
+        'reason': 'AWS EC2 metadata service query'
+    },
+    {
+        'parent_process': 'python',
+        'child_process': 'curl', 
+        'arg_contains': ['169.254.169.254', 'metadata'],
+        'reason': 'AWS EC2 metadata service query'
+    },
+    {
+        'parent_dir_contains': '/amazon/ssm/',
+        'child_process': 'curl',
+        'arg_contains': ['169.254.169.254'],
+        'reason': 'AWS SSM patch operations'
+    }
+]
+
+EPHEMERAL_PATTERNS = [
+    # AWS tokens
+    (r'X-aws-ec2-metadata-token:\s*[A-Za-z0-9+/=]+', 'X-aws-ec2-metadata-token: <TOKEN>'),
+    (r'x-amz-security-token[=:]\s*[A-Za-z0-9+/=]+', 'x-amz-security-token=<TOKEN>'),
+    
+    # Session IDs
+    (r'session[_-]?id[=:]\s*[A-Za-z0-9-]+', 'session_id=<SESSION>'),
+    (r'JSESSIONID[=:][A-Za-z0-9]+', 'JSESSIONID=<SESSION>'),
+    
+    # Timestamps
+    (r'\d{13,}', '<TIMESTAMP>'),  # Unix millisecond timestamps
+    (r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}', '<DATETIME>'),
+    
+    # UUIDs
+    (r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}', '<UUID>'),
+   
+    (r':\s*[A-Za-z0-9+/]{40,}={0,2}', ': <BASE64>'),
+    
+    # API keys/tokens (generic)
+    (r'(api[_-]?key|token|bearer)[=:]\s*[A-Za-z0-9+/=_-]{20,}', r'\1=<KEY>'),
+    
+    # Generic session/token parameters (any system)
+    (r'(session|token|key|bearer)[=:]\s*[A-Za-z0-9+/=_-]{20,}', r'\1=<VALUE>'),
+]
+
+
 # ============================================================
 # Model / tokenizer / config extensions (Python-side)
 # ============================================================
