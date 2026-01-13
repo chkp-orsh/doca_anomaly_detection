@@ -868,7 +868,14 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
             if pd.notna(row.get('UserName')):
                 baselines[key]['users'].add(row['UserName'])
             
-            
+            # NEW: Track normalized process directories
+            if pd.notna(row.get('ProcessDir')):
+                norm_proc_dir = self._normalize_directory_path(row['ProcessDir'])
+                if norm_proc_dir:
+                    if 'process_dirs' not in baselines[key]:
+                        baselines[key]['process_dirs'] = set()
+                    baselines[key]['process_dirs'].add(norm_proc_dir)
+                    
             if pd.notna(row.get('file_mod_details')):
                 try:
                     ops = self._safe_parse_list(row['file_mod_details'])
@@ -912,9 +919,12 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                 
                 normalized_parent_args = self._normalize_process_args(parent.get('ProcessArgs'))
                 parent_signer = self._normalize_signer(parent.get('ProcessSigner'))
+                
                 key = (child_row['MachineName'], parent['ProcessName'], normalized_parent_args, parent_signer)
                             
-                child_process = child_row.get('ProcessName')
+                child_process = AIDRTools._normalize_spawned_process_name(child_row.get('ProcessName'))
+                
+                
                 child_args_normalized = self._normalize_process_args(child_row.get('ProcessArgs'))
                 
                 if child_process:
@@ -925,13 +935,7 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                 if child_row.get('ProcessArgs'):
                     baselines[key]['spawned_args'].add(child_row['ProcessArgs'])
                                                 
-            # NEW: Track normalized process directories
-                if pd.notna(row.get('ProcessDir')):
-                    norm_proc_dir = self._normalize_directory_path(row['ProcessDir'])
-                    if norm_proc_dir:
-                        if 'process_dirs' not in baselines[key]:
-                            baselines[key]['process_dirs'] = set()
-                        baselines[key]['process_dirs'].add(norm_proc_dir)
+
             
         else:
             print("  ⚠️ No child process data available")
@@ -1935,7 +1939,8 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                     baseline_spawned = baseline.get('spawned_with_args', set())
 
                     for _, child in children_of_this.iterrows():
-                        child_process = child.get('ProcessName')
+                        #child_process = child.get('ProcessName')
+                        child_process = AIDRTools._normalize_spawned_process_name (child.get('ProcessName'))
                         child_args = child.get('ProcessArgs')
                         #exact_match = (child_process, child_args_norm) in baseline_spawned
                         
