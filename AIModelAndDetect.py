@@ -20,6 +20,7 @@ import ast
 import hashlib
 import StatisticalModelHelper
 import AIDRTools
+import tenant_baseline_abstractor
 
 import ai_anomaly_defs
 from ai_anomaly_defs import REGEX_PATTERNS
@@ -246,6 +247,8 @@ class AIAgentAnomalyDetector:
         return self._enrich_anomaly(anomaly)
     
     def _execute_query(self, query, max_tries=5, sleepTimeinSecs=30):
+        
+        #print (query)
         for trys in range(0, max_tries):
             try:
                 query = f"set servertimeout = 10m;\nset query_results_cache_max_age = 0d;\n{query}"
@@ -259,7 +262,7 @@ class AIAgentAnomalyDetector:
                 return df
             except Exception as e:
                 str_error = str(e).lower()
-                substrings = ["Failed to resolve table expression","Access denied","Failed to obtain Az","Az login", "access", "connection", "network"]
+                substrings = ["Failed to resolve table expression","kusto","Access denied","Failed to obtain Az","Az login", "access", "connection", "network","temporarily","admin","temporarily"]
     
                 print(f"❌ Query error: {e}")
                 if any(sub.lower() in str_error for sub in substrings):
@@ -1127,6 +1130,83 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
         print(f"💾 Saved statistical baseline to {filepath}")
         return filepath
     
+    def load_tenant_baseline(self, filepath: str | None = None) -> dict:
+        """
+        tenant (cross-tenant) baseline: keys like:
+          ProcessName||normalized_args||signer
+        Stored as JSON dict.
+        """
+        candidates = []
+        if filepath:
+            candidates.append(filepath)
+
+        # common locations
+        candidates.extend([
+            os.path.join(self.output_dir, "baselines", "tenant_abstraction_latest.json"),
+            os.path.join(self.output_dir, "tenant_abstraction_latest.json"),
+            "tenant_abstraction_latest.json",
+        ])
+
+        for p in candidates:
+            if p and os.path.exists(p):
+                try:
+                    with open(p, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    if isinstance(data, dict):
+                        print(f"✅ Loaded tenant baseline: {p} ({len(data)} keys)")
+                        return data
+                except Exception as e:
+                    print(f"⚠️ Failed loading tenant baseline from {p}: {e}")
+
+        print("⚠️ No tenant baseline found (tenant abstraction baseline). Continuing without it.")
+        return {}
+
+
+    def _tenant_baseline_key(self, row: pd.Series, normalized_args: str, signer: str) -> str:
+        """
+        Build the key used by the global baseline.
+        IMPORTANT: match exactly whatever your tenant_abstraction_latest.json uses.
+        Assumption here: ProcessName||normalized_args||signer
+        """
+        return f"{row.get('ProcessName', '')}||{normalized_args}||{signer}"
+
+
+    def _downgrade_severity_one_step(self, sev: str) -> str:
+        order = ["INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL"]
+        sev = (sev or "INFO").upper()
+        if sev not in order:
+            return "LOW"
+        i = order.index(sev)
+        return order[max(0, i - 1)]
+
+    
+    
+
+    def _apply_tenant_baseline_suppression(self, anomalies: list, in_tenant_baseline: bool, tenant_key: str) -> list:
+        """
+        If the (process||normalized_args||signer) triplet exists in the tenant baseline,
+        downgrade severity and convert alert/event anomaly types to LOG_*.
+        """
+        if not anomalies or not in_tenant_baseline:
+            return anomalies
+
+        for a in anomalies:
+            old_type = a.get("type", "UNKNOWN")
+            old_sev = a.get("severity", "LOW")
+
+            a["severity"] = self._downgrade_severity_one_step(old_sev)
+
+            if not old_type.startswith("LOG_"):
+                a["type"] = f"LOG_{old_type}"
+
+            bc = a.get("baseline_context") or {}
+            bc["tenant_baseline_match"] = True
+            bc["tenant_baseline_key"] = tenant_key
+            a["baseline_context"] = bc
+
+        return anomalies
+
+
     def load_baseline(self):
         """Load baseline from JSON"""
         filepath = os.path.join(self.output_dir, 'baselines', 'baseline_latest.json')
@@ -1208,7 +1288,7 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
     
     
         
-    def detect_anomalies(self, df_process, df_children, baselines, min_occurrences=3):
+    def detect_anomalies(self, df_process, df_children, baselines, min_occurrences=3, tenant_baseline=None):
         """Detect anomalies using statistical models"""
         print(f"\n🔍 Detecting anomalies with statistical models...")
         
@@ -1221,6 +1301,7 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
             return pd.DataFrame()
         
         all_alerts = []
+        tenant_baseline = tenant_baseline or {}
         matched_keys = 0
         unmatched_keys = 0
         
@@ -1230,6 +1311,10 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                 user = row.get('UserName', 'UNKNOWN')
                 signer = self._normalize_signer(row.get('ProcessSigner'))
                 key = (row['MachineName'], row['ProcessName'], normalized_args, signer)
+                
+                tenant_key = self._tenant_baseline_key(row, normalized_args, signer)
+                in_tenant_baseline = tenant_key in tenant_baseline
+                
                 
                 # Check signer change
                 same_triplet_signers = [
@@ -1245,6 +1330,21 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                     event_time = row.get('CreationTime')
                     alert_timestamp = str(int(event_time)) if event_time and pd.notna(event_time) else "UNKNOWN"
 
+                    signer_anomalies = [
+                        self._make_anomaly(
+                            type="ALERT_PROCESS_SIGNER_CHANGED",
+                            severity=severity,
+                            details=f"Signer changed: '{signer}' not in baseline",
+                            row=row,
+                            baseline=None,
+                            normalized_args=normalized_args,
+                            occurrence_count=0,
+                            confidence_score=0.95,
+                            extra={"current_signer": signer, "baseline_signers": list(set(same_triplet_signers))[:10]}
+                        )
+                    ]
+                    signer_anomalies = self._apply_tenant_baseline_suppression(signer_anomalies, in_tenant_baseline, tenant_key)
+
                     all_alerts.append({
                         "timestamp": alert_timestamp,
                         "machine": row["MachineName"],
@@ -1253,24 +1353,13 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                         "user": user,
                         "signer": signer,
                         "process_args": str(row.get("ProcessArgs", ""))[:200],
-                        "anomaly_count": 1,
-                        "max_confidence_score": 0.95,
+                        "anomaly_count": len(signer_anomalies),
+                        "max_confidence_score": max(a.get("confidence_score", 0.0) for a in signer_anomalies),
                         "baseline_context": {
-                            "status": "SIGNER_CHANGED"
+                            "status": "TENANT_BASELINE_MATCH" if in_tenant_baseline else "SIGNER_CHANGED",
+                            "tenant_baseline_key": tenant_key if in_tenant_baseline else None
                         },
-                        'anomalies': [
-                            self._make_anomaly(
-                                type="ALERT_PROCESS_SIGNER_CHANGED",
-                                severity=severity,
-                                details=f"Signer changed: '{signer}' not in baseline",
-                                row=row,
-                                baseline=None,
-                                normalized_args=normalized_args,
-                                occurrence_count=0,
-                                confidence_score=0.95,
-                                extra={"current_signer": signer, "baseline_signers": list(set(same_triplet_signers))[:10]}
-                            )
-                        ]
+                        "anomalies": signer_anomalies
                     })
                     continue
                 
@@ -1991,6 +2080,7 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                                     )
 
                 if anomalies:
+                    anomalies = self._apply_tenant_baseline_suppression(anomalies, in_tenant_baseline, tenant_key)
                     max_confidence = max(a.get('confidence_score', 0.0) for a in anomalies)
                     
                     all_alerts.append({
@@ -2004,8 +2094,9 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                         'anomaly_count': len(anomalies),
                         'max_confidence_score': float(max_confidence),
                         'baseline_context': {
-                            'status': 'ACTIVE_DETECTION',
-                            'occurrence_count': occurrence_count
+                            'status': 'TENANT_BASELINE_MATCH' if in_tenant_baseline else 'ACTIVE_DETECTION',
+                            'occurrence_count': occurrence_count,
+                            'tenant_baseline_key': tenant_key if in_tenant_baseline else None
                         },
                         'anomalies': anomalies
                     })
@@ -2586,6 +2677,10 @@ def execute(cluster, database, tenant, output_dir, mode, lookback_unit='day',
             except Exception as e:
                 print(f"❌ Error: {e}")
         
+
+        print (f"########### Updating tenant_base line: {output_dir}")
+        tenant_baseline_abstractor.process_single_tenant (output_dir) #(os.path.join(output_dir,tenant))
+        
         print(f"\n✅ Collected {successful} periods")
         
         if all_process:
@@ -2627,6 +2722,7 @@ def execute(cluster, database, tenant, output_dir, mode, lookback_unit='day',
     
     elif mode == 'detect':
         baselines = detector.load_baseline()
+        tenant_baseline = detector.load_tenant_baseline()
         
         if not baselines:
             print("⚠️ No baseline. Run bootstrap first.")
@@ -2656,8 +2752,8 @@ def execute(cluster, database, tenant, output_dir, mode, lookback_unit='day',
         
         
         if (df_proc is not None and len(df_proc) > 0) or (df_child is not None and len(df_child) > 0):
-            #alerts = detector.detect_anomalies(df_proc, df_child, baselines, min_occurrences=3)
-            alerts = detector.detect_anomalies(df_proc_focus, df_child, baselines, min_occurrences=3)
+            #alerts = detector.detect_anomalies(df_proc, df_child, baselines, min_occurrences=3, tenant_baseline=tenant_baseline)
+            alerts = detector.detect_anomalies(df_proc_focus, df_child, baselines, min_occurrences=3,tenant_baseline=tenant_baseline)
 
             
             if alerts is not None and len(alerts) > 0:

@@ -106,6 +106,11 @@ KNOWN_AI_SERVING_PROCESS_NAMES = {
     "oobabooga", "webui",
     "open-webui", "openwebui",
     "litellm", "litellm.exe",
+    "llamafile", "llamafile.exe",
+    "jan", "jan.exe",  # jan.ai
+    "gpt4all", "gpt4all.exe",
+    "anythingllm", "anythingllm.exe",
+    "localai", "localai.exe"
 }
 
 GENERIC_INTERPRETER_PROCESS_NAMES = {
@@ -124,7 +129,14 @@ GENERIC_INTERPRETER_PROCESS_NAMES = {
 # ============================================================
 REGEX_PATTERNS = {
     # Replace GUIDs / hashes (tune if too aggressive)
-    "guid": re.compile(r"\b[0-9a-fA-F]{8}\b-(?:[0-9a-fA-F]{4}\b-){3}[0-9a-fA-F]{12}\b"),
+        "guid": re.compile(
+        r"[0-9a-fA-F]{8}-"
+        r"[0-9a-fA-F]{4}-"
+        r"[0-9a-fA-F]{4}-"
+        r"[0-9a-fA-F]{4}-"
+        r"[0-9a-fA-F]{12}",
+        re.IGNORECASE
+    ),
     "sha256": re.compile(r"\b[0-9a-fA-F]{64}\b"),
     "sha1": re.compile(r"\b[0-9a-fA-F]{40}\b"),
     "md5": re.compile(r"\b[0-9a-fA-F]{32}\b"),
@@ -162,7 +174,17 @@ LLM_API_PATH_FRAGMENTS = ["/sse", "/mcp/v1", "/events", "/chat/completions", "/v
 LLM_API_DOMAINS = [
     "api.openai.com", "openai.azure.com", "api.anthropic.com", "generativelanguage.googleapis.com",
     "api.mistral.ai", "api.cohere.ai", "api.groq.com", "openrouter.ai",
-    "api-inference.huggingface.co", "api.replicate.com", "api.stability.ai", "litellm"
+    "api-inference.huggingface.co", "api.replicate.com", "api.stability.ai", "litellm",
+    "claude.ai",  # Anthropic consumer endpoint
+    "gemini.google.com",
+    "api.perplexity.ai",
+    "api.together.xyz",
+    "api.fireworks.ai",
+    "api.deepseek.com",
+    #MODEL_REGISTRY_DOMAINS, adding them here to not change the codce, but will need to separate eventually
+    "huggingface.co",
+    "civitai.com",
+    "ollama.com",  # model downloads
 ]
 
 KNOWN_AI_SERVING_PROCESS_NAMES = ["open-webui", "litellm", "vllm", "ollama", "torchserve", "oobabooga", "koboldcpp", "lmstudio"]
@@ -170,7 +192,7 @@ GENERIC_INTERPRETER_PROCESS_NAMES = ["python", "python3", "node", "npm", "java",
 
 AI_CMDLINE_KEYWORDS = ["mcp_server", "mcp-server", "--model", "inference", "serve", "server", "llm", "embeddings"]
 
-AI_MODULE_FILENAME_PATTERNS = ["torch_cpu", "torch_cuda", "transformers", "tokenizers", "llama", "tensorrt", "cudart", "cublas", "cudnn"]
+AI_MODULE_FILENAME_PATTERNS = ["torch_cpu", "torch_cuda", "transformers", "tokenizers", "llama", "tensorrt", "cudart", "cublas", "cudnn","langchain", "llamaindex", "autogen", "crewai", "semantic_kernel"]
 AI_MODULE_PATH_PATTERNS = ["torch", "transformers", "tokenizers", "onnx", "checkpoints", "models", "litellm", "fastchat", "vicuna"]
 
 MODEL_FILE_EXTENSIONS = ["ckpt", "pt", "pth", "safetensors", "onnx", "pb", "tflite", "gguf", "ggml", "h5", "pkl", "model"]

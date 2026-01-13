@@ -161,9 +161,53 @@ def normalize_process_args_ef(args):
     # (keep your existing path, PID, timestamp normalization)
     
     return normalized
+
+
+def normalize_process_args(args):
+    if not args or pd.isna(args):
+        return ""
+
+    import re
+    args = str(args)
+
+    # Defensive normalization for volatile compound IDs
+    args = re.sub(
+        r'(--native_msg_channel=)[^\s]+',
+        r'\1<GUID_CHANNEL>',
+        args,
+        flags=re.IGNORECASE
+    )
+        
+    args = re.sub(
+        r'--native_msg_channel=[^ ]*<NUM>[^ ]*',
+        '--native_msg_channel=<GUID_CHANNEL>',
+        args,
+        flags=re.IGNORECASE
+    )    
+    # Replace full GUIDs anywhere in token
+    args = REGEX_PATTERNS["guid"].sub("<GUID>", args)
+
+    # Hashes
+    args = REGEX_PATTERNS["sha256"].sub("<SHA256>", args)
+    args = REGEX_PATTERNS["sha1"].sub("<SHA1>", args)
+    args = REGEX_PATTERNS["md5"].sub("<MD5>", args)
+
+    # Only now do numeric/path/etc replacement
+    args = re.sub(r'\b\d{4,}\b', '<NUM>', args)
+    args = re.sub(r'[A-Za-z]:\\[^\s]+', '<PATH>', args, flags=re.IGNORECASE)
+    args = re.sub(r'/[^\s]+\.(pt|pkl|onnx|h5|bin|gguf|pth|safetensors)', '<MODELFILE>', args)
+    args = re.sub(r'/[^\s/]+/[^\s]+', '<PATH>', args)
+    args = re.sub(r'\d{8}_\d{6}', '<TIMESTAMP>', args)
+    args = re.sub(r'\d{4}-\d{2}-\d{2}', '<DATE>', args)
+    args = re.sub(r':\d{4,5}', ':<PORT>', args)
+    args = re.sub(r'0x[0-9a-f]+', '<HEX>', args, flags=re.IGNORECASE)
+
+    args = normalize_process_args_ef(args)
+    return args.strip()
+
     
     
-def normalize_process_args( args):
+def normalize_process_args_old( args):
     """Extract stable command pattern"""
     if not args or pd.isna(args):
         return ""
