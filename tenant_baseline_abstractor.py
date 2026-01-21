@@ -31,6 +31,8 @@ OUTPUT_SUBDIR_NAME = "tenant_abstractions"
 IGNORED_LIST_FIELDS = {
     # Example:
     # "detection_reason",  # (usually dict, but just in case)
+    "parent_patterns",  # Structured data, not a simple list
+    "parent_contexts",
 }
 
 # =========================
@@ -55,11 +57,42 @@ def _is_list_field(v: Any) -> bool:
     return isinstance(v, list)
 
 
-def _safe_key(item: Any) -> Any:
+def _safe_key_old(item: Any) -> Any:
     # Make items hashable for use as dict keys
     if isinstance(item, (list, tuple)):
         return tuple(item)
     return item
+
+def _safe_key(item):
+    """Return a stable, hashable representation for use as dict keys.
+
+    IMPORTANT: For primitive items (str/int/float/bool/None) this returns the
+    item unchanged, preserving historical output.
+    """
+    # primitives: keep exactly as-is
+    if item is None or isinstance(item, (str, int, float, bool)):
+        return item
+
+    # dicts are unhashable -> make deterministic tuple of pairs
+    if isinstance(item, dict):
+        # sort by key string for determinism (handles mixed key types safely)
+        return tuple(
+            (_safe_key(k), _safe_key(v))
+            for k, v in sorted(item.items(), key=lambda kv: str(kv[0]))
+        )
+
+    # lists/tuples/sets -> tuple (recursively)
+    if isinstance(item, (list, tuple, set)):
+        return tuple(_safe_key(x) for x in item)
+
+    # if it's already hashable, keep it; otherwise fall back to repr
+    try:
+        hash(item)
+        return item
+    except TypeError:
+        return repr(item)
+
+
 
 
 import msvcrt
@@ -72,10 +105,19 @@ def process_single_tenant(tenant_dir: str) -> dict:
     
     baseline_path = os.path.join(
         tenant_dir, "baselines", "baseline_latest.json"
-    )
+        )
+    print (f"########### tenant_base_line_abstractor: {baseline_path} ")
     if not os.path.exists(baseline_path):
         #raise FileNotFoundError(baseline_path)
-        return NameError
+        
+        baseline_path = os.path.join(
+        tenant_dir, "collection","baselines", "baseline_latest.json"
+        )
+        print (f"########### tenant_base_line_abstractor: switched to {baseline_path}  ")
+        if not os.path.exists(baseline_path):
+            print (f"########### tenant_base_line_abstractor: failed -  to {baseline_path}  ")
+            return NameError
+        
 
     saved_baseline = load_json(baseline_path)
 
@@ -85,9 +127,15 @@ def process_single_tenant(tenant_dir: str) -> dict:
     if isinstance(tenant_abs, dict):
         print (f"########### tenant_base_line_abstractor:{tenant_dir}, {len(tenant_abs.keys())} items in tenant baseline")
 
-    out_dir = os.path.join(
-        tenant_dir, "baselines", "tenant_abstractions"
-    )
+    
+    if "collection" in  baseline_path: 
+        out_dir = os.path.join(
+            tenant_dir, "collection","baselines", "tenant_abstractions"
+        )
+    else:
+            out_dir = os.path.join(
+            tenant_dir, "baselines", "tenant_abstractions"
+        )
     os.makedirs(out_dir, exist_ok=True)
 
     out_latest = os.path.join(out_dir, "tenant_abstraction_latest.json")

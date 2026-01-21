@@ -6,13 +6,17 @@ import os
 from datetime import datetime, timedelta
 import argparse
 #import ai_anomaly_detector
-import AIModelAndDetect11
+import AIModelAndDetect22
 from multiprocessing import Process
 #from ai_anomaly_detector import execute
-from AIModelAndDetect11 import execute
+from AIModelAndDetect22 import execute
 import time
 import json, random
 import hashlib
+import global_baseline_builder
+
+#temp
+import tenant_baseline_abstractor
 
 
 # ========= CONFIGURATION =========
@@ -202,11 +206,15 @@ def collect_for_tenant(cluster, database, tenant, output_dir, mode, lookback_uni
                 if modification_datetime >= twenty_four_hours_ago or creation_datetime >= twenty_four_hours_ago or file_mod_time.date() == current_time.date():    
                 #if file_mod_time.date() == datetime.now().date():
                     print(f"⏭️ Wrapper Skipping {tenant} - baseline already created or modified on: ",modification_datetime)
+                    
+                    #temp: Only run abstractor
+                    tenant_baseline_abstractor.process_single_tenant (tenant_dir) #(os.path.join(output_dir,tenant))
+                    
                     return
         print (f"⏭️ Wrapper - creating/addoing baseline for: ",baseline_file)
         print ("============")
         
-        AIModelAndDetect11.execute(
+        AIModelAndDetect22.execute(
             cluster=cluster,
             database=database,
             tenant=tenant,
@@ -262,13 +270,14 @@ def main():
             #safe_save_csv("c:\\tmp\\tables",fieldnames=["TableName", "TotalRowCount"],
             
             #tables[0]="ab9f0d29_bb7c_48b6_b3a3_80454fccc83f"
+            #tables[1]="55c10744_5b25_4e6c_9c32_42ca01f38484"
             ####print (tables)
             processes = []
             #i=0
             for i,t in enumerate (tables):
                 if i<1000:
                     try:
-                        max_parallel=20
+                        max_parallel=15
                         sleep_time=4*args.bootstrap_count+4*args.lookback_count
                         print(f"{i} Wrapper Running query on table: {t} (DB: {db}, Cluster: {cluster_uri}),  have {max_parallel} processed lounched. Waiting {sleep_time} secs")
                         #input("Press Enter to continue...")
@@ -393,8 +402,11 @@ def main():
         print("✅ Wrapper All tenants processed!")
         print("="*80)
         
+        print(f"   Building global baseline {args.output_dir}")
+        global_baseline, stats = global_baseline_builder.process_tenants_root (args.output_dir)
         
-        
+        print("Tenants processed:", stats.get("processed_tenants"))
+        print("Global keys:", len(global_baseline))
         
 
         #print(f"\n✅ Started {len(tables)} parallel collection+training processes!")
