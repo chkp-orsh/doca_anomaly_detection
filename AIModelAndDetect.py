@@ -89,11 +89,58 @@ class AIAgentAnomalyDetector:
     def _to_json_str(self, v, max_len=20000):
         return AIDRTools.to_json_str(v, max_len)
     
+    def _baseline_relevant_json(self, anomaly: dict) -> dict:
+        """Return a compact, alert-type-specific view: baseline vs observed vs delta."""
+        if not anomaly:
+            return {}
+        a_type = anomaly.get("type") or ""
+        b = anomaly.get("baseline_full") or {}
+        obs = anomaly.get("observed") or {}
+
+        def _set_sorted(x):
+            try:
+                return sorted({str(v) for v in x if v is not None and str(v).strip()})
+            except Exception:
+                return []
+
+        if "ALERT_NEW_PORTS" in a_type:
+            base = _set_sorted(b.get("contacted_ports", []))
+            cur = _set_sorted(obs.get("contacted_ports", []))
+            newp = sorted(set(cur) - set(base))
+            return {"baseline_ports": base[:200], "observed_ports": cur[:200], "new_ports": newp[:200]}
+
+        if "ALERT_NEW_IPS" in a_type:
+            base = _set_sorted(b.get("contacted_ips", []))
+            cur = _set_sorted(obs.get("contacted_ips", []))
+            newi = sorted(set(cur) - set(base))
+            analysis = anomaly.get("new_ips_analysis") or []
+            return {"baseline_ips": base[:200], "observed_ips": cur[:200], "new_ips": newi[:200], "new_ips_analysis": analysis[:50]}
+
+        if "ALERT_NEW_DOMAINS" in a_type:
+            base = _set_sorted(b.get("contacted_domains", []))
+            cur = _set_sorted(obs.get("contacted_domains", []))
+            newd = sorted(set(cur) - set(base))
+            return {"baseline_domains": base[:200], "observed_domains": cur[:200], "new_domains": newd[:200]}
+
+        if "ALERT_PROCESS_RUNNING_FROM_NEW_LOCATION" in a_type:
+            base_dirs = _set_sorted(b.get("process_dirs", []))
+            cur_dir = obs.get("process_dir") or anomaly.get("current_process_dir")
+            return {"baseline_process_dirs_sample": base_dirs[:50], "observed_process_dir": cur_dir}
+
+        return {}
+
+
+    
+    
+    
     def _get_current_date(self):
         return AIDRTools.get_current_date()
     
     def _days_since(self, date_str):
         return AIDRTools.days_since(date_str)
+    
+    
+    
     
     def _get_obfuscation_key(self):
         """Extract obfuscation key from output_dir"""
@@ -275,7 +322,7 @@ class AIAgentAnomalyDetector:
                     "contacted_ips": self._safe_parse_list(row.get("contacted_ips")) if row is not None else [],
                     "contacted_ports": self._safe_parse_list(row.get("contacted_ports")) if row is not None else [],
                     "accessed_files": self._safe_parse_list(row.get("accessed_files")) if row is not None else [],
-                    "accessed_dirs": self._safe_parse_list(row.get("accessed_dirs")) if row is not None else [],
+                    "accessed_dirs": [self._normalize_directory_path(d) for d in (self._safe_parse_list(row.get("accessed_dirs")) if row is not None else []) if d],
                     "modified_model_files": self._safe_parse_list(row.get("modified_model_files")) if row is not None else [],
                     "network_bytes_sent": int(row.get("NetworkBytesSent_sum", 0)) if row is not None else 0,
                     "network_bytes_received": int(row.get("NetworkBytesReceived_sum", 0)) if row is not None else 0,
@@ -311,143 +358,35 @@ class AIAgentAnomalyDetector:
                     if len(model_path_hits) >= 10:
                         break
             anomaly["observed"]["model_path_hits"] = model_path_hits
-
-            # existing tenant/global suppression
+            # tenant/global suppression (behavior-aware):
+            # Only downgrade if the *specific anomalous behavior* is common at tenant/global scope.
             try:
-                tb = getattr(self, "_tenant_baseline_cache", None) or {}
-                gb = getattr(self, "_global_baseline_cache", None) or {}
-
                 if row is not None:
                     tenant_key = self._tenant_baseline_key(row, normalized_args, signer)
-                    in_tb = tenant_key in tb
-                    anomaly = self._apply_scope_baseline_suppression_to_anomaly(
-                        anomaly, scope="tenant", baseline_key=tenant_key, matched=in_tb
+                    anomaly = self._apply_scope_suppression_if_behavior_matches(
+                        anomaly, scope="tenant", baseline_key=tenant_key
                     )
 
                     global_key = self._global_baseline_key(row, normalized_args, signer)
-                    in_gb = global_key in gb
-                    if (not in_gb) and "||" in global_key and global_key.count("||") == 3:
+                    # Backward compatible fallback (some global baselines might omit OS in the key)
+                    entry = self._scope_baseline_entry("global", global_key)
+                    if (not entry) and "||" in global_key and global_key.count("||") == 3:
                         fallback_key = "||".join(global_key.split("||")[:3])
-                        in_gb = fallback_key in gb
-                        if in_gb:
+                        if self._scope_baseline_entry("global", fallback_key):
                             global_key = fallback_key
-                    anomaly = self._apply_scope_baseline_suppression_to_anomaly(
-                        anomaly, scope="global", baseline_key=global_key, matched=in_gb
+
+                    anomaly = self._apply_scope_suppression_if_behavior_matches(
+                        anomaly, scope="global", baseline_key=global_key
                     )
             except Exception:
                 pass
+
 
             return self._enrich_anomaly(anomaly)
 
 
 
-    def _make_anomaly_old(
-        self,
-        *,
-        type: str,
-        severity: str,
-        details: str,
-        row=None,
-        baseline=None,
-        df_children=None,
-        normalized_args="",
-        occurrence_count=0,
-        baseline_context=None,
-        extra=None,
-        confidence_score=0.0
-    ) -> dict:
-        """Build anomaly with statistical confidence"""
 
-        baseline_context = baseline_context or {}
-        extra = extra or {}
-
-        machine = row.get("MachineName") if row is not None else ""
-        process = row.get("ProcessName") if row is not None else ""
-        user = row.get("UserName", "UNKNOWN") if row is not None else "UNKNOWN"
-        signer = self._normalize_signer(row.get("ProcessSigner")) if row is not None else "ERR:NOT-REPORTED"
-        pid = int(row.get("Pid", 0)) if row is not None and pd.notna(row.get("Pid")) else None
-
-        anomaly = {
-            "type": type,
-            "severity": severity,
-            "details": details,
-            "confidence_score": float(confidence_score),
-
-            "machine": machine,
-            "process": process,
-            "pid": pid,
-            "user": user,
-            "signer": signer,
-
-            "baseline_context": baseline_context,
-
-            "observed": {
-                "process_dir": row.get("ProcessDir") if row is not None else None,
-                "process_args": str(row.get("ProcessArgs", ""))[:2000] if row is not None else "",
-                "normalized_args": normalized_args,
-                "contacted_domains": self._safe_parse_list(row.get("contacted_domains")) if row is not None else [],
-                "contacted_ips": self._safe_parse_list(row.get("contacted_ips")) if row is not None else [],
-                "contacted_ports": self._safe_parse_list(row.get("contacted_ports")) if row is not None else [],
-                "accessed_files": self._safe_parse_list(row.get("accessed_files")) if row is not None else [],
-                "accessed_dirs": self._safe_parse_list(row.get("accessed_dirs")) if row is not None else [],
-                "modified_model_files": self._safe_parse_list(row.get("modified_model_files")) if row is not None else [],
-                "network_bytes_sent": int(row.get("NetworkBytesSent_sum", 0)) if row is not None else 0,
-                "network_bytes_received": int(row.get("NetworkBytesReceived_sum", 0)) if row is not None else 0,
-                "process_hash": row.get("ProcessHash") if row is not None else None,
-                "ai_score": float(row.get("aiScore_avg", 0)) if row is not None else 0.0,
-            }
-        }
-
-        if baseline:
-            anomaly["baseline_snapshot"] = {
-                "occurrence_count": occurrence_count,
-                "baseline_users": list(baseline.get("users", set())),
-                "baseline_domains": list(baseline.get("contacted_domains", set())),
-                "baseline_dirs": list(baseline.get("accessed_dirs", set())),
-                "baseline_spawned_processes": list(baseline.get("spawned_processes", set())),
-            }
-
-        anomaly.update(extra)
-        
-        model_path_hits = []
-        for d in anomaly["observed"].get("accessed_dirs", []):
-            if any(p.search(d) for p in MODEL_PATH_PATTERNS):
-                model_path_hits.append(d)
-                if len(model_path_hits) >= 10:
-                    break
-
-        anomaly["observed"]["model_path_hits"] = model_path_hits
-        # Per-anomaly suppression using tenant/global baselines (cached by detect_anomalies)
-        try:
-            tb = getattr(self, "_tenant_baseline_cache", None) or {}
-            gb = getattr(self, "_global_baseline_cache", None) or {}
-
-            if row is not None:
-                # Tenant baseline match
-                tenant_key = self._tenant_baseline_key(row, normalized_args, signer)
-                in_tb = tenant_key in tb
-                anomaly = self._apply_scope_baseline_suppression_to_anomaly(
-                    anomaly, scope="tenant", baseline_key=tenant_key, matched=in_tb
-                )
-
-                # Global baseline match (try OS-aware key first, then fallback)
-                global_key = self._global_baseline_key(row, normalized_args, signer)
-                in_gb = global_key in gb
-                if (not in_gb) and "||" in global_key and global_key.count("||") == 3:
-                    # remove OS suffix
-                    fallback_key = "||".join(global_key.split("||")[:3])
-                    in_gb = fallback_key in gb
-                    if in_gb:
-                        global_key = fallback_key
-                anomaly = self._apply_scope_baseline_suppression_to_anomaly(
-                    anomaly, scope="global", baseline_key=global_key, matched=in_gb
-                )
-        except Exception:
-            # Suppression should never break anomaly creation
-            pass
-
-        return self._enrich_anomaly(anomaly)
-    
     def _execute_query(self, query, max_tries=5, sleepTimeinSecs=30):
         
         #print (query)
@@ -464,7 +403,7 @@ class AIAgentAnomalyDetector:
                 return df
             except Exception as e:
                 str_error = str(e).lower()
-                substrings = ["Failed to resolve table expression","kusto","Access denied","Failed to obtain Az","Az login", "access", "connection", "network","temporarily","admin","temporarily"]
+                substrings = ["https","Failed to resolve table expression","kusto","Access denied","Failed to obtain Az","Az login", "access", "connection", "network","temporarily","admin","temporarily"]
     
                 print(f"❌ Query error: {e}")
                 if any(sub.lower() in str_error for sub in substrings):
@@ -1036,6 +975,7 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
             ParentProcessClassification = take_any(ParentProcessClassification),
             ParentProcessIntegrityLevel = take_any(ParentProcessIntegrityLevel),
             ParentProcessMD5 = take_any(ParentProcessMD5),
+            ProcessClassification = take_any(ProcessClassification),
             ProcessIntegrityLevel = take_any(ProcessIntegrityLevel),
             ProcessPPidCreationTime = take_any(ProcessPPidCreationTime),
             DomainName = take_any(DomainName),
@@ -1631,15 +1571,18 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
         candidates = []
         if filepath:
             candidates.append(filepath)
-
+        
+        print (f"load_tenant_baseline {filepath}, self.output_dir: {self.output_dir}" )
         # common locations
         candidates.extend([
             os.path.join(self.output_dir, "baselines", "tenant_abstraction_latest.json"),
+            os.path.join(self.output_dir, "baselines","tenant_abstractions", "tenant_abstraction_latest.json"),
             os.path.join(self.output_dir, "tenant_abstraction_latest.json"),
             "tenant_abstraction_latest.json",
         ])
 
         for p in candidates:
+            #print (f"p: {p}" )
             if p and os.path.exists(p):
                 try:
                     with open(p, "r", encoding="utf-8") as f:
@@ -1650,7 +1593,7 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                 except Exception as e:
                     print(f"⚠️ Failed loading tenant baseline from {p}: {e}")
 
-        print("⚠️ No tenant baseline found (tenant abstraction baseline). Continuing without it.")
+        print(f"⚠️ No tenant baseline found (tenant abstraction baseline), filepath: {filepath},self.output_dir: {self.output_dir}, p: {p}. Continuing without it.")
         return {}
 
 
@@ -1671,15 +1614,18 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
         candidates: list[str] = []
         if filepath:
             candidates.append(filepath)
-
+        print (f"load_global_baseline filepath {filepath}, self.output_dir: {self.output_dir}")
+        
         # Common locations (you may pass explicit filepath from caller)
         candidates.extend([
             os.path.join(self.output_dir, "global_baseline_latest.json"),
+            os.path.join(self.output_dir, "..","..", "global_baselines","global_baseline_latest.json"),
             os.path.join(self.output_dir, "baselines", "global_baseline_latest.json"),
             "global_baseline_latest.json",
         ])
 
         for p in candidates:
+            #print (f"p: {p}")
             if p and os.path.exists(p):
                 try:
                     with open(p, "r", encoding="utf-8") as f:
@@ -1688,9 +1634,9 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                         print(f"✅ Loaded global baseline: {p} ({len(data)} keys)")
                         return data
                 except Exception as e:
-                    print(f"⚠️ Failed loading global baseline from {p}: {e}")
+                    print(f"⚠️ Failed loading global baseline  {filepath} from {p}: {e}")
 
-        print("⚠️ No global baseline found. Continuing without it.")
+        print(f"⚠️ No global baseline found. Continuing without it. filepath: {filepath}, p:{p}, self.output_dir: {self.output_dir}")
         return {}
 
 
@@ -1709,6 +1655,175 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
         return f"{process}||{normalized_args}||{signer}"
 
 
+    def _scope_baseline_entry(self, scope: str, baseline_key: str) -> dict:
+        """Return baseline entry dict for a given scope+key, or {}."""
+        if scope == "tenant":
+            b = getattr(self, "_tenant_baseline_cache", None) or {}
+        elif scope == "global":
+            b = getattr(self, "_global_baseline_cache", None) or {}
+        else:
+            b = {}
+        entry = b.get(baseline_key, {})
+        return entry if isinstance(entry, dict) else {}
+
+    def _as_set(self, v, normalize_fn=None) -> set:
+        """Convert baseline JSON fields (list/tuple/set/str) into a normalized set."""
+        if v is None:
+            items = []
+        elif isinstance(v, (set, frozenset, list, tuple)):
+            items = list(v)
+        else:
+            # single scalar
+            items = [v]
+        out = set()
+        for x in items:
+            if x is None:
+                continue
+            s = str(x).strip()
+            if not s:
+                continue
+            if normalize_fn:
+                try:
+                    s = normalize_fn(s)
+                except Exception:
+                    pass
+            if s:
+                out.add(s)
+        return out
+
+    def _scope_field_items_set(self, scope_entry: dict, field: str, *, scope: str, normalize_fn=None) -> set:
+        """
+        Return the set of "common" items for a given field in a scope baseline entry.
+
+        Supports:
+          - Legacy scope baselines that store list fields directly at top-level (e.g. entry["contacted_domains"] = [...])
+          - Tenant abstraction entries (entry["fields"][field]["consensus_items"] / ["item_machine_counts"])
+          - Global baseline entries (entry["fields"][field] = {item: count, ...})
+        """
+        if not scope_entry or not field:
+            return set()
+
+        # 1) Legacy: top-level list field
+        if field in scope_entry:
+            return self._as_set(scope_entry.get(field), normalize_fn=normalize_fn)
+
+        fields = scope_entry.get("fields") or {}
+        if not isinstance(fields, dict):
+            return set()
+
+        fentry = fields.get(field)
+        if fentry is None:
+            # some producers might use singular names
+            if field.endswith("s") and (field[:-1] in fields):
+                fentry = fields.get(field[:-1])
+            elif (field + "s") in fields:
+                fentry = fields.get(field + "s")
+            else:
+                return set()
+
+        # 2) Tenant abstraction: dict with consensus_items / item_machine_counts
+        if isinstance(fentry, dict) and ("consensus_items" in fentry or "item_machine_counts" in fentry):
+            if scope == "tenant":
+                items = fentry.get("consensus_items")
+                if not items:
+                    # fallback to all known items (less strict)
+                    imc = fentry.get("item_machine_counts") or {}
+                    items = list(imc.keys()) if isinstance(imc, dict) else []
+            else:
+                # global baseline shouldn't hit this, but be tolerant
+                imc = fentry.get("item_machine_counts") or {}
+                items = list(imc.keys()) if isinstance(imc, dict) else (items or [])
+            return self._as_set(items, normalize_fn=normalize_fn)
+
+        # 3) Global baseline: dict of {item: count}
+        if isinstance(fentry, dict):
+            return self._as_set(list(fentry.keys()), normalize_fn=normalize_fn)
+
+        # 4) Anything else (list-like)
+        return self._as_set(fentry, normalize_fn=normalize_fn)
+
+    def _scope_behavior_match(self, anomaly: dict, scope_entry: dict, *, scope: str) -> bool:
+        """True iff the *specific* anomalous behavior is present in the scope baseline entry."""
+        if not anomaly or not scope_entry:
+            return False
+
+        a_type = (anomaly.get("type") or "").upper()
+
+        try:
+            observed = anomaly.get("observed") or {}
+            baseline_full = anomaly.get("baseline_full") or {}
+
+            # --- New domains ---
+            if "NEW_DOMAINS" in a_type:
+                cur = self._as_set(observed.get("contacted_domains"))
+                base = self._as_set(baseline_full.get("contacted_domains"))
+                new_items = cur - base
+                if not new_items:
+                    return False
+                scope_domains = self._scope_field_items_set(scope_entry, "contacted_domains", scope=scope)
+                return new_items.issubset(scope_domains)
+
+            # --- New IPs ---
+            if "NEW_IPS" in a_type:
+                cur = self._as_set(observed.get("contacted_ips"))
+                base = self._as_set(baseline_full.get("contacted_ips"))
+                new_items = cur - base
+                if not new_items:
+                    return False
+                scope_ips = self._scope_field_items_set(scope_entry, "contacted_ips", scope=scope)
+                return new_items.issubset(scope_ips)
+
+            # --- New ports ---
+            if "NEW_PORTS" in a_type:
+                cur = self._as_set(observed.get("contacted_ports"), normalize_fn=lambda x: str(x))
+                base = self._as_set(baseline_full.get("contacted_ports"), normalize_fn=lambda x: str(x))
+                new_items = cur - base
+                if not new_items:
+                    return False
+                scope_ports = self._scope_field_items_set(scope_entry, "contacted_ports", scope=scope, normalize_fn=lambda x: str(x))
+                return new_items.issubset(scope_ports)
+
+            # --- New accessed directories ---
+            if "NEW_DIRECTORIES" in a_type:
+                cur = self._as_set(observed.get("accessed_dirs"), normalize_fn=self._normalize_directory_path)
+                base = self._as_set(baseline_full.get("accessed_dirs"), normalize_fn=self._normalize_directory_path)
+                new_items = cur - base
+                if not new_items:
+                    return False
+                scope_dirs = self._scope_field_items_set(scope_entry, "accessed_dirs", scope=scope, normalize_fn=self._normalize_directory_path)
+                return new_items.issubset(scope_dirs)
+
+            # --- Process running from new location ---
+            if "PROCESS_RUNNING_FROM_NEW_LOCATION" in a_type:
+                cur_dir = anomaly.get("current_process_dir") or observed.get("process_dir")
+                cur_dir = self._normalize_directory_path(cur_dir) if cur_dir else ""
+                if not cur_dir:
+                    return False
+
+                # machine baseline uses "process_dirs" (plural). Keep that, but map to abstractions/global fields.
+                scope_proc_dirs = self._scope_field_items_set(scope_entry, "process_dirs", scope=scope, normalize_fn=self._normalize_directory_path)
+                if not scope_proc_dirs:
+                    # tolerate singular producer
+                    scope_proc_dirs = self._scope_field_items_set(scope_entry, "process_dir", scope=scope, normalize_fn=self._normalize_directory_path)
+                return cur_dir in scope_proc_dirs
+
+        except Exception:
+            return False
+
+        return False
+
+    def _apply_scope_suppression_if_behavior_matches(self, anomaly: dict, *, scope: str, baseline_key: str) -> dict:
+        """Apply LOG+severity downgrade only if the scope baseline matches the specific behavior."""
+        entry = self._scope_baseline_entry(scope, baseline_key)
+        matched = self._scope_behavior_match(anomaly, entry, scope=scope)
+        return self._apply_scope_baseline_suppression_to_anomaly(
+            anomaly, scope=scope, baseline_key=baseline_key, matched=matched
+        )
+
+
+
+
+
     def _apply_scope_baseline_suppression_to_anomaly(self, anomaly: dict, *, scope: str, baseline_key: str, matched: bool) -> dict:
         """
         If baseline matched (tenant/global), downgrade severity and convert alert/event anomaly types to LOG_*.
@@ -1718,11 +1833,16 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
             return anomaly
 
         old_type = anomaly.get("type", "UNKNOWN")
+        
+        
         old_sev = anomaly.get("severity", "LOW")
 
         anomaly["severity"] = self._downgrade_severity_one_step(old_sev)
-        if not old_type.startswith("LOG_"):
+        if not old_type.startswith("LOG_") and not old_type.startswith("EVENT_"):
+            #print (f"downgrading anomaly: {old_type}, scope: {scope},baseline_key: {baseline_key}, matched: {matched}")
             anomaly["type"] = f"LOG_{old_type}"
+            anomaly["type"]=anomaly["type"].replace ("LOG_ALERT_","LOG_DOWN_",1)
+            #print (f"replacing {old_type} with {anomaly["type"]}"  )
 
         bc = anomaly.get("baseline_context") or {}
         bc[f"{scope}_baseline_match"] = True
@@ -1936,6 +2056,20 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                         "pid": int(row["Pid"]) if pd.notna(row["Pid"]) else 0,
                         "user": user,
                         "signer": signer,
+                        "ParentProcessName": row.get("ParentProcessName"),
+                        "ParentProcessDir": row.get("ParentProcessDir"),
+                        "ParentProcessArgs": row.get("ParentProcessArgs"),
+                        "ParentProcessSigner": row.get("ParentProcessSigner"),
+                        "ParentProcessClassification": row.get("ParentProcessClassification"),
+                        "ParentProcessIntegrityLevel": row.get("ParentProcessIntegrityLevel"),
+                        "ParentProcessMD5": row.get("ParentProcessMD5"),
+                        "ProcessClassification": row.get("ProcessClassification"),
+                        "ProcessIntegrityLevel": row.get("ProcessIntegrityLevel"),
+                        "ProcessPPidCreationTime": row.get("ProcessPPidCreationTime"),
+                        "DomainName": row.get("DomainName"),
+                        "UserSID": row.get("UserSID"),
+                        "FirstSeenInPeriod": row.get("FirstSeen"),
+                        "LastSeenInPeriod": row.get("LastSeen"),
                         "process_args": str(row.get("ProcessArgs", ""))[:200],
                         "ProcessHash": str(row.get("ProcessHash", ""))[:200],
                         "anomaly_count": len(signer_anomalies),
@@ -1971,6 +2105,20 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                         'pid': int(row['Pid']) if pd.notna(row['Pid']) else 0,
                         'user': user,
                         'signer': signer,
+                        'ParentProcessName': row.get('ParentProcessName'),
+                        'ParentProcessDir': row.get('ParentProcessDir'),
+                        'ParentProcessArgs': row.get('ParentProcessArgs'),
+                        'ParentProcessSigner': row.get('ParentProcessSigner'),
+                        'ParentProcessClassification': row.get('ParentProcessClassification'),
+                        'ParentProcessIntegrityLevel': row.get('ParentProcessIntegrityLevel'),
+                        'ParentProcessMD5': row.get('ParentProcessMD5'),
+                        'ProcessClassification': row.get('ProcessClassification'),
+                        'ProcessIntegrityLevel': row.get('ProcessIntegrityLevel'),
+                        'ProcessPPidCreationTime': row.get('ProcessPPidCreationTime'),
+                        'DomainName': row.get('DomainName'),
+                        'UserSID': row.get('UserSID'),
+                        'FirstSeenInPeriod': row.get('FirstSeen'),
+                        'LastSeenInPeriod': row.get('LastSeen'),
                         'process_args': str(row.get('ProcessArgs', ''))[:200],
                         'anomaly_count': 1,
                         'max_confidence_score': confidence,
@@ -2767,7 +2915,7 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                                     )
 
                 if anomalies:
-                    anomalies = self._apply_tenant_baseline_suppression(anomalies, in_tenant_baseline, tenant_key)
+                    # tenant/global suppression is applied per-anomaly in _make_anomaly (behavior-aware)
                     max_confidence = max(a.get('confidence_score', 0.0) for a in anomalies)
                     
                     all_alerts.append({
@@ -2794,8 +2942,9 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                         'UserSID': row.get('UserSID'),
                         
                         # NEW: Add timing context
-                        'FirstSeenInPeriod': row.get('FirstSeenInPeriod'),
-                        'LastSeenInPeriod': row.get('LastSeenInPeriod'),
+                        'FirstSeenInPeriod': row.get('FirstSeen'),
+                        'LastSeenInPeriod': row.get('LastSeen'),
+
                         
                         # NEW: Add baseline parent context (if exists)
                         'baseline_parent_context': self._get_baseline_parent_context(baseline, row) if baseline else {},
@@ -2862,6 +3011,12 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                     'ai_risk': ",".join(anomaly.get("ai_risk", [])),
                     'observed_json': self._to_json_str(anomaly.get("observed", {})),
                     'baseline_context_json': self._to_json_str(anomaly.get("baseline_context", {})),
+                    'baseline_relevant_json': self._to_json_str(self._baseline_relevant_json(anomaly)),
+                    'tenant_baseline_match': bool((anomaly.get('baseline_context') or {}).get('tenant_baseline_match')),
+                    'tenant_baseline_key': (anomaly.get('baseline_context') or {}).get('tenant_baseline_key'),
+                    'global_baseline_match': bool((anomaly.get('baseline_context') or {}).get('global_baseline_match')),
+                    'global_baseline_key': (anomaly.get('baseline_context') or {}).get('global_baseline_key'),
+
                     'anomaly_json': self._to_json_str(anomaly),
                     'ParentProcessName': alert.get('ParentProcessName'),
                     'ParentProcessDir': alert.get('ParentProcessDir'),
@@ -2870,13 +3025,33 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                     'ParentProcessClassification': alert.get('ParentProcessClassification'),
                     'ParentProcessIntegrityLevel': alert.get('ParentProcessIntegrityLevel'),
                     'ParentProcessMD5': alert.get('ParentProcessMD5'),
-                    'ProcessClassification': alert.get('ProcessClassification'),
+                    'ProcessClassification': (alert.get('ProcessClassification') or (anomaly.get('observed') or {}).get('ProcessClassification')),
                     'ProcessIntegrityLevel': alert.get('ProcessIntegrityLevel'),
                     'ProcessPPidCreationTime': alert.get('ProcessPPidCreationTime'),
-                    'DomainName': alert.get('DomainName'),
-                    'UserSID': alert.get('UserSID'),
-                    'FirstSeenInPeriod': alert.get('FirstSeenInPeriod'),
-                    'LastSeenInPeriod': alert.get('LastSeenInPeriod'),
+                    'DomainName': (alert.get('DomainName') or (anomaly.get('observed') or {}).get('DomainName')),
+                    'UserSID': (alert.get('UserSID') or (anomaly.get('observed') or {}).get('UserSID')),
+                    'FirstSeenInPeriod': (alert.get('FirstSeenInPeriod') or (anomaly.get('observed') or {}).get('FirstSeenInPeriod')),
+                    'LastSeenInPeriod': (alert.get('LastSeenInPeriod') or (anomaly.get('observed') or {}).get('LastSeenInPeriod')),
+                    'BytesSent': (
+                        alert.get('BytesSent')
+                        or (anomaly.get('observed') or {}).get('network_bytes_sent')
+                        or (anomaly.get('observed_row_full') or {}).get('NetworkBytesSent_sum')
+                    ),
+                    'BytesReceived': (
+                        alert.get('BytesReceived')
+                        or (anomaly.get('observed') or {}).get('network_bytes_received')
+                        or (anomaly.get('observed_row_full') or {}).get('NetworkBytesReceived_sum')
+                    ),
+
+                    'ProcessHash': (
+                        alert.get('ProcessHash')
+                        or (anomaly.get('observed') or {}).get('ProcessHash')
+                        or (anomaly.get('observed') or {}).get('SHA256')
+                        or (anomaly.get('observed') or {}).get('Sha256')
+                        or (anomaly.get('observed') or {}).get('MD5')
+                    ),
+
+
                 }
                 
                 flat_alert["alert_id"] = self._alert_id(alert, anomaly)
@@ -3466,6 +3641,8 @@ def execute(cluster, database, tenant, output_dir, mode, lookback_unit='day',
     elif mode == 'detect':
         baselines = detector.load_baseline()
         tenant_baseline = detector.load_tenant_baseline()
+        global_baseline = detector.load_global_baseline()
+
         
         if not baselines:
             print("⚠️ No baseline. Run bootstrap first.")
@@ -3500,7 +3677,8 @@ def execute(cluster, database, tenant, output_dir, mode, lookback_unit='day',
         
         if (df_proc is not None and len(df_proc) > 0) or (df_child is not None and len(df_child) > 0):
             #alerts = detector.detect_anomalies(df_proc, df_child, baselines, min_occurrences=3, tenant_baseline=tenant_baseline)
-            alerts = detector.detect_anomalies(df_proc_focus, df_child, baselines, min_occurrences=3,tenant_baseline=tenant_baseline)
+            #alerts = detector.detect_anomalies(df_proc_focus, df_child, baselines, min_occurrences=3,tenant_baseline=tenant_baseline)
+            alerts = detector.detect_anomalies(df_proc_focus, df_child, baselines, min_occurrences=3, tenant_baseline=tenant_baseline, global_baseline=global_baseline)
 
             
             if alerts is not None and len(alerts) > 0:

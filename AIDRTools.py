@@ -7,7 +7,9 @@ import numpy as np
 import json
 import re
 import hashlib
+import os
 from datetime import datetime
+
 from ai_anomaly_defs import REGEX_PATTERNS, MODEL_PATH_PATTERNS
 
 def format_alert_as_checkpoint_log(alert, anomaly, detector):
@@ -240,6 +242,7 @@ def normalize_directory_path( path):
     
     import re
     path = str(path).lower()
+    path = os.path.dirname(path)
     
     path = REGEX_PATTERNS["user_profile"].sub(r"\\users\\<USER>\\", path)
     path = re.sub(r'\\device\\harddiskvolume\d+', r'\\device\\harddiskvolume<VOL>', path)
@@ -253,8 +256,38 @@ def normalize_directory_path( path):
     path = re.sub(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', '<GUID>', path, flags=re.IGNORECASE)
     path = re.sub(r'[_\\]v?\d+\.\d+(\.\d+)?', r'\<VER>', path)
     path = re.sub(r'[_\\]\d+$', '', path)
+            # Canonical separators + lowercase
+    p = path.replace("/", "\\")
+    p = re.sub(r"\\{2,}", r"\\", p).strip()
+    p = p.rstrip("\\").lower()
+
+    # Remove Windows extended-length prefix
+    p = re.sub(r"^\\\\\?\\", "", p)
+
+    # Normalize drive letter case
+    p = re.sub(r"^([a-z]):\\", lambda m: m.group(1).lower() + ":\\", p)
+
+    # Normalize user profile segment (c:\users\<name>\ -> c:\users\<user>\)
+    p = re.sub(r"(?i)^([a-z]:\\users\\)([^\\]+)(\\)", r"\1<user>\3", p)
+
+    # Normalize common temp random subdirs (e.g., ...\appdata\local\temp\{guid}\)
+    p = re.sub(r"(?i)(\\appdata\\local\\temp\\)[0-9a-f\-]{6,}(\\)?$", r"\1<tempid>", p)
+
+    # Normalize WindowsApps package folders: <pkg>_<ver>_<arch>__<publisher>
+    # Example: ...\windowsapps\msteams_25330.206.335.0_x64__8wekyb3d8bbwe\
+    p = re.sub(r"(?i)(\\windowsapps\\[^\\]+?)_\d+(?:\.\d+){1,5}_[^\\]+", r"\1_<ver>_<arch>", p)
+
+    # Normalize any folder token that contains a long numeric version (avoid false 'new location')
+    p = re.sub(r"(?i)(\\driverstore\\filerepository\\[^\\]+?)_amd64_[0-9a-f]{8,}", r"\1_amd64_<hash>", p)
+
+    p = re.sub(r"(?i)(\\)[^\\]*\d+(?:\.\d+){1,5}[^\\]*(?=\\|$)", r"\1<verdir>", p)
     
-    return path.strip()
+    p = re.sub(
+            r"(?i)(\\msteams\\logs\\ai_models\\).*",
+            r"\1<AI_MODELS>",
+            p)
+    
+    return p.strip()
 
 
 def normalize_signer( signer):
@@ -299,7 +332,12 @@ def to_json_str(v, max_len: int = 20000) -> str:
         s = str(v)
 
     if max_len and len(s) > max_len:
-        return s[:max_len] + "...(truncated)"
+        preview = s[: max(0, max_len - 200)]
+        return json.dumps({
+                "_truncated": True,
+                "preview": preview,
+                "original_len": len(s)
+            }, ensure_ascii=False)
     return s
     
     
