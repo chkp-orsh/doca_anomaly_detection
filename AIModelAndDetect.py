@@ -11,6 +11,7 @@ from azure.kusto.data.helpers import dataframe_from_result_table
 from collections import defaultdict
 from difflib import SequenceMatcher
 from collections import Counter
+from IncidentAnalyzer29 import IncidentAnalyzer2 
 
 import warnings
 warnings.filterwarnings('ignore')
@@ -126,6 +127,93 @@ class AIAgentAnomalyDetector:
             base_dirs = _set_sorted(b.get("process_dirs", []))
             cur_dir = obs.get("process_dir") or anomaly.get("current_process_dir")
             return {"baseline_process_dirs_sample": base_dirs[:50], "observed_process_dir": cur_dir}
+
+        if "ALERT_NEW_USER_FOR_PROCESS" in a_type:
+            return {
+                "baseline_users": _set_sorted(b.get("users", [])),
+                "observed_user": anomaly.get("current_user"),
+            }
+
+        if "ALERT_PROCESS_SIGNER_CHANGED" in a_type:
+            return {
+                "baseline_signers": _set_sorted(b.get("signers", [])),
+                "observed_signer": anomaly.get("current_signer"),
+            }
+
+        if "ALERT_EXCESSIVE_TRANSFER" in a_type:
+            stats = b.get("stats") or {}
+            return {
+                "baseline_bytes_sent_mean": stats.get("bytes_sent_mean"),
+                "baseline_bytes_sent_p99":  stats.get("bytes_sent_p99"),
+                "baseline_bytes_sent_std":  stats.get("bytes_sent_std"),
+                "observed_bytes_sent":      anomaly.get("bytes_sent"),
+                "z_score":                  anomaly.get("z_score"),
+            }
+
+        if "ALERT_NEW_DIRECTORIES" in a_type:
+            base = _set_sorted(b.get("accessed_dirs", []))
+            cur  = _set_sorted(obs.get("accessed_dirs", []))
+            new  = anomaly.get("new_directories") or sorted(set(cur) - set(base))
+            return {"baseline_dirs": base[:200], "observed_dirs": cur[:200], "new_dirs": new[:200]}
+
+        if "ALERT_NEW_FILE_EXTENSIONS" in a_type:
+            return {
+                "baseline_extensions":   _set_sorted(b.get("accessed_extensions", [])),
+                "new_extensions":        anomaly.get("new_extensions") or [],
+                "high_risk_extensions":  anomaly.get("high_risk_extensions") or [],
+            }
+
+        if "ALERT_ACCESSING_MANY_NEW_FILES" in a_type:
+            return {
+                "baseline_files_sample": _set_sorted(b.get("accessed_files", []))[:50],
+                "new_files_sample":      anomaly.get("new_files_sample") or [],
+            }
+
+        if "ALERT_UNUSUAL_PARENT_FOR_PROCESS" in a_type:
+            return {
+                "baseline_parent_contexts": anomaly.get("baseline_parent_contexts") or [],
+                "observed_parent":          anomaly.get("current_parent") or {},
+            }
+
+        if "ALERT_ELEVATED_PRIVILEGES" in a_type:
+            return {
+                "baseline_integrity_levels": anomaly.get("baseline_integrity_levels") or {},
+                "observed_integrity_level":  anomaly.get("current_integrity_level"),
+                "delta_rank":                anomaly.get("delta_rank"),
+            }
+
+        if "ALERT_NEW_MODEL_FILE_MODIFICATION" in a_type:
+            return {
+                "baseline_model_files_ever_modified": anomaly.get("all_baseline_model_files_ever_modified") or [],
+                "observed_file":                      anomaly.get("file"),
+                "observed_user":                      anomaly.get("modifying_user"),
+            }
+
+        if "ALERT_MODEL_FILE_MODIFIED_BY_NEW_USER" in a_type:
+            return {
+                "baseline_authorized_users_for_file": anomaly.get("baseline_authorized_users_for_file") or [],
+                "baseline_all_users_for_process":     anomaly.get("baseline_all_users_for_process") or [],
+                "observed_user":                      anomaly.get("current_user"),
+                "file":                               anomaly.get("file"),
+            }
+
+        if "ALERT_MODEL_FILE_MODIFIED_WITH_UNUSUAL_ARGS" in a_type:
+            return {
+                "best_matching_baseline_arg": anomaly.get("best_matching_baseline_arg"),
+                "similarity_score":           anomaly.get("similarity_to_best_baseline"),
+                "observed_args":              anomaly.get("current_args"),
+                "file":                       anomaly.get("file"),
+            }
+
+        if "ALERT_NEW_SPAWNED_PROCESS" in a_type or "ALERT_SPAWNED_PROCESS_UNUSUAL_ARGS" in a_type:
+            snap = anomaly.get("baseline_snapshot") or {}
+            return {
+                "baseline_spawned_processes": snap.get("baseline_spawned_processes") or [],
+                "observed_child_process":     anomaly.get("child_process"),
+                "observed_child_args":        anomaly.get("child_args") or anomaly.get("child_actual_args"),
+                "similarity_score":           anomaly.get("similarity_score"),
+                "most_similar_baseline_args": anomaly.get("most_similar_baseline"),
+            }
 
         return {}
 
@@ -328,6 +416,9 @@ class AIAgentAnomalyDetector:
                     "network_bytes_received": int(row.get("NetworkBytesReceived_sum", 0)) if row is not None else 0,
                     "process_hash": row.get("ProcessHash") if row is not None else None,
                     "ai_score": float(row.get("aiScore_avg", 0)) if row is not None else 0.0,
+                    "os": row.get("OS") if row is not None else None,
+                    "os_version": row.get("OSVersion") if row is not None else None,
+                    "host_type": row.get("HostType") if row is not None else None,
                 },
 
                 # NEW: full row snapshot (all columns) for offline analysis
@@ -387,7 +478,7 @@ class AIAgentAnomalyDetector:
 
 
 
-    def _execute_query(self, query, max_tries=5, sleepTimeinSecs=30):
+    def _execute_query(self, query, max_tries=10, sleepTimeinSecs=60):
         
         #print (query)
         for trys in range(0, max_tries):
@@ -877,7 +968,7 @@ set query_results_cache_max_age = 0d;
 set maxmemoryconsumptionperiterator=16106127360;
 let longNetworkCon=15m;
 let InterestingProcessRunTime=15m;
-let processIgnoreList=dynamic(["setup.exe","ms-teams.exe"]);
+let processIgnoreList=dynamic(["setup.exe","ms-teams.exe","msiexec.exe","ms-teams","teams"]);
 let ToolProcessNames = {_kusto_dynamic_str_list(TOOL_PROCESS_NAMES)};
 let CommonDevOrBrowserProcesses = {_kusto_dynamic_str_list(COMMON_DEV_OR_BROWSER_PROCESSES)};
 let LocalhostAddresses = {_kusto_dynamic_str_list(LOCALHOST_ADDRESSES)};
@@ -899,7 +990,7 @@ let SuspiciousDirs = dynamic(["temp", "tmp", "downloads", "desktop", "documents"
 database("9327dadc-4486-45cc-919a-23953d952df4-e8240").table("{self.tenant_id}")
 | where OpTimeSecondsUTC between ({start_time} .. {end_time})
 | extend FileExtension = tolower(extract(@"\\.([^.]+)$", 1, FileName))
-//|where tolower(ProcessName) !in (processIgnoreList)
+|where tolower(ProcessName) !in (processIgnoreList)
 | where tolower(FileName) has_any (FileNameSearch) or tolower(FileDir) has_any (FileDirSearch) 
 or tolower(ProcessArgs) has_any (AICmdlineKeywords) 
 //or tolower(ParentProcessArgs) has_any (AICmdlineKeywords) 
@@ -940,7 +1031,7 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
 | where aiScore >= {SEVERITY_THRESHOLDS["min_ai_score"]}
 | summarize event_count = count(),            
             ProcessHash=take_any(ProcessMD5),
-            OS=take_any(OSName), OSVersion=take_any (OSVersion),
+            OS=take_any(OSName), OSVersion=take_any (OSVersion),HostType=take_any(HostType),
             PidCreationTime = take_any(PidCreationTime),
             //NetworkBytesSent_sum = sum(NetworkBytesSent),
             //NetworkBytesReceived_sum = sum(NetworkBytesReceived),
@@ -1047,7 +1138,7 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
     | where OpTimeSecondsUTC between ({start_time} .. {end_time})
     | where ProcessPPidCreationTime in (AIParents)
     //| where PidCreationTime in (AIParents)
-    | project MachineName, ParentProcessName, ProcessPPidCreationTime, ProcessName, ProcessArgs, ProcessDir, ProcessSigner, ParentProcessSigner, ProcessHash=ProcessMD5
+    | project MachineName, ParentProcessName, ProcessPPidCreationTime, PidCreationTime, ProcessName, ProcessArgs, ProcessDir, ProcessSigner, ParentProcessSigner, ProcessHash=ProcessMD5
     | take 10000"""
        
         #print ("===========")
@@ -1986,6 +2077,62 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
     
     
         
+    def _build_child_extra(self, *, child_process: str, child_args, child_row, df_process) -> dict:
+        """
+        Build the `extra` dict for ALERT_NEW_SPAWNED_PROCESS / ALERT_SPAWNED_PROCESS_UNUSUAL_ARGS.
+        Includes child identity fields and, when available, the child's own activity from df_process.
+        """
+        raw_hash   = child_row.get("ProcessHash")
+        raw_signer = child_row.get("ProcessSigner")
+        raw_dir    = child_row.get("ProcessDir")
+        raw_pct    = child_row.get("PidCreationTime")
+        raw_machine = child_row.get("MachineName")
+
+        extra = {
+            "child_process":           child_process,
+            "child_args":              str(child_args) if child_args is not None else None,
+            "spawned_process_args":    str(child_args) if child_args is not None else None,
+            "child_hash":              str(raw_hash)   if raw_hash   is not None and str(raw_hash).strip() else None,
+            "child_signer":            self._normalize_signer(raw_signer),
+            "child_dir":               str(raw_dir)    if raw_dir    is not None and str(raw_dir).strip()  else None,
+            "child_pid_creation_time": str(raw_pct)    if raw_pct    is not None and str(raw_pct).strip()  else None,
+            "child_machine":           str(raw_machine) if raw_machine is not None else None,
+        }
+
+        # Try to look up the child's own row in df_process (it may have been collected
+        # as a process in its own right, giving us network / file activity columns).
+        child_activity = {}
+        try:
+            if df_process is not None and not df_process.empty:
+                machine = child_row.get("MachineName", "")
+                child_pct = child_row.get("PidCreationTime")
+                if machine and child_pct and "PidCreationTime" in df_process.columns:
+                    match = df_process[
+                        (df_process["MachineName"] == machine) &
+                        (df_process["PidCreationTime"] == child_pct)
+                    ]
+                    if not match.empty:
+                        cr = match.iloc[0]
+                        child_activity = {
+                            "contacted_domains":      self._safe_parse_list(cr.get("contacted_domains")),
+                            "contacted_ips":          self._safe_parse_list(cr.get("contacted_ips")),
+                            "contacted_ports":        self._safe_parse_list(cr.get("contacted_ports")),
+                            "accessed_files":         self._safe_parse_list(cr.get("accessed_files")),
+                            "accessed_dirs":          [
+                                self._normalize_directory_path(d)
+                                for d in self._safe_parse_list(cr.get("accessed_dirs")) if d
+                            ],
+                            "modified_model_files":   self._safe_parse_list(cr.get("modified_model_files")),
+                            "network_bytes_sent":     int(cr.get("NetworkBytesSent_sum", 0) or 0),
+                            "network_bytes_received": int(cr.get("NetworkBytesReceived_sum", 0) or 0),
+                            "ai_score":               float(cr.get("aiScore_avg", 0) or 0),
+                        }
+        except Exception:
+            pass
+
+        extra["child_activity"] = child_activity if child_activity else None
+        return extra
+
     def detect_anomalies(self, df_process, df_children, baselines, min_occurrences=3, tenant_baseline=None, global_baseline=None):
         """Detect anomalies using statistical models"""
         print(f"\n🔍 Detecting anomalies with statistical models...")
@@ -2058,7 +2205,7 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                         "signer": signer,
                         "ParentProcessName": row.get("ParentProcessName"),
                         "ParentProcessDir": row.get("ParentProcessDir"),
-                        "ParentProcessArgs": row.get("ParentProcessArgs"),
+                        "ParentProcessArgs": str(row.get("ParentProcessArgs", "")) if pd.notna(row.get("ParentProcessArgs")) else None,
                         "ParentProcessSigner": row.get("ParentProcessSigner"),
                         "ParentProcessClassification": row.get("ParentProcessClassification"),
                         "ParentProcessIntegrityLevel": row.get("ParentProcessIntegrityLevel"),
@@ -2070,8 +2217,8 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                         "UserSID": row.get("UserSID"),
                         "FirstSeenInPeriod": row.get("FirstSeen"),
                         "LastSeenInPeriod": row.get("LastSeen"),
-                        "process_args": str(row.get("ProcessArgs", ""))[:200],
-                        "ProcessHash": str(row.get("ProcessHash", ""))[:200],
+                        "process_args": str(row.get("ProcessArgs", "")),
+                        "ProcessHash": str(row.get("ProcessHash", "")),
                         "anomaly_count": len(signer_anomalies),
                         "max_confidence_score": max(a.get("confidence_score", 0.0) for a in signer_anomalies),
                         "baseline_context": {
@@ -2119,7 +2266,8 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                         'UserSID': row.get('UserSID'),
                         'FirstSeenInPeriod': row.get('FirstSeen'),
                         'LastSeenInPeriod': row.get('LastSeen'),
-                        'process_args': str(row.get('ProcessArgs', ''))[:200],
+                        'process_args': str(row.get('ProcessArgs', '')),
+                        'ProcessHash': str(row.get('ProcessHash', '')),
                         'anomaly_count': 1,
                         'max_confidence_score': confidence,
                         'anomalies': [
@@ -2135,9 +2283,9 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                                 extra={
                                     "distance_analysis": distance_details,
                                     "new_agent_key": {
-                                        "machine": row['MachineName'][:50],
+                                        "machine": row['MachineName'],
                                         "process": row['ProcessName'],
-                                        "args_preview": normalized_args[:100],
+                                        "args_preview": normalized_args,
                                         "signer": signer
                                     },
                                     "contacted_domains_sample": current_domains,
@@ -2164,7 +2312,7 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                         'pid': int(row['Pid']) if pd.notna(row['Pid']) else 0,
                         'user': user,
                         'signer': signer,
-                        'process_args': str(row.get('ProcessArgs', ''))[:200],
+                        'process_args': str(row.get('ProcessArgs', '')),
                         'anomaly_count': 1,
                         'max_confidence_score': learning_confidence,
                         'anomalies': [
@@ -2285,7 +2433,7 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                         normalized_args=normalized_args,
                         occurrence_count=occurrence_count,
                         confidence_score=float(avg_confidence),
-                        extra={"new_domains": truly_new_domains[:10]}
+                        extra={"new_domains": truly_new_domains[:20], "baseline_domains_sample": list(baseline_domains)[:20]}
                     ))
                 
                 # EXCESSIVE TRANSFER (Z-score)
@@ -2311,7 +2459,14 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                                 normalized_args=normalized_args,
                                 occurrence_count=occurrence_count,
                                 confidence_score=float(confidence),
-                                extra={"z_score": f"{z_score:.2f}", "bytes_sent": int(bytes_sent)}
+                                extra={
+                                    "z_score": f"{z_score:.2f}",
+                                    "bytes_sent": int(bytes_sent),
+                                    "bytes_received": int(row.get("NetworkBytesReceived_sum", 0) or 0),
+                                    "baseline_mean": int(mean_sent),
+                                    "baseline_std":  int(std_sent),
+                                    "baseline_p99":  int(p99_sent),
+                                }
                             )
                         )
                 
@@ -2346,7 +2501,7 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                             normalized_args=normalized_args,
                             occurrence_count=occurrence_count,
                             confidence_score=float(avg_confidence),
-                            extra={"new_directories": truly_new_dirs[:10]}
+                            extra={"new_directories": truly_new_dirs[:20], "baseline_dirs_sample": list(baseline_dirs)[:20]}
                         )
                     )
                 
@@ -2385,8 +2540,9 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                             occurrence_count=occurrence_count,
                             confidence_score=max_confidence,
                             extra={
-                                "new_ips_analysis": ip_alerts[:10],  # Detailed analysis for each IP
-                                "baseline_ips_sample": list(baseline_ips)[:5],
+                                "new_ips": [a["ip"] for a in ip_alerts],
+                                "new_ips_analysis": ip_alerts[:20],
+                                "baseline_ips_sample": list(baseline_ips)[:10],
                                 "scoring_method": "subnet_and_geolocation"
                             }
                         )
@@ -2412,7 +2568,7 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                             normalized_args=normalized_args,
                             occurrence_count=occurrence_count,
                             confidence_score=port_confidence,
-                            extra={"new_ports": list(new_ports)[:10]}
+                            extra={"new_ports": list(new_ports)[:20], "baseline_ports_sample": list(baseline_ports)[:20]}
                         )
                     )
                 
@@ -2532,7 +2688,7 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                                         "classification": current_parent_class,
                                         "integrity_level": row.get('ParentProcessIntegrityLevel'),
                                         "dir": row.get('ParentProcessDir'),
-                                        "args_preview": str(row.get('ParentProcessArgs', ''))[:200] if pd.notna(row.get('ParentProcessArgs')) else None,
+                                        "args_preview": str(row.get('ParentProcessArgs', '')) if pd.notna(row.get('ParentProcessArgs')) else None,
                                     },
                                     "baseline_parent_contexts": baseline_parent_contexts[:10]
                                 }
@@ -2649,7 +2805,7 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                                     "file_type": original_file.split('.')[-1] if '.' in original_file else "unknown",
                                     "modifying_user": mod_user,
                                     "modifying_process": row["ProcessName"],
-                                    "modifying_process_args": str(row.get("ProcessArgs", ""))[:500],
+                                    "modifying_process_args": str(row.get("ProcessArgs", "")),
                                     "modifying_pid": int(row["Pid"]) if pd.notna(row["Pid"]) else None,
                                     "contacted_domains": (
                                         list(ast.literal_eval(domains))[:10]
@@ -2743,11 +2899,10 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                                             extra={
                                                 "file": original_file,
                                                 "normalized_file": norm_file,
-                                                "current_args": str(mod_args)[:500],
+                                                "current_args": str(mod_args),
                                                 "similarity_to_best_baseline": f"{max_sim:.2f}",
-                                                "best_matching_baseline_arg": (
-                                                    str(best_match)[:200] if best_match else None
-                                                ),
+                                                "best_matching_baseline_arg": str(best_match) if best_match else None,
+                                                "all_baseline_args": [str(a) for a in list(baseline_args)[:20]],
                                                 "modifying_user": mod_user,
                                                 "modifying_process": row["ProcessName"]
                                             }
@@ -2855,10 +3010,12 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                                             "status": "ACTIVE_DETECTION",
                                             "reason": "NEW_SPAWNED_PROCESS"
                                         },
-                                        extra={
-                                            "child_process": child_process,
-                                            "child_args": str(child_args)[:200] if child_args else ""
-                                        }
+                                        extra=self._build_child_extra(
+                                            child_process=child_process,
+                                            child_args=child_args,
+                                            child_row=child,
+                                            df_process=df_process,
+                                        )
                                     )
                                 )
                             else:
@@ -2902,14 +3059,16 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                                                 "reason": "SPAWNED_PROCESS_UNUSUAL_ARGS"
                                             },
                                             extra={
-                                                "child_process": child_process,
+                                                **self._build_child_extra(
+                                                    child_process=child_process,
+                                                    child_args=child_args,
+                                                    child_row=child,
+                                                    df_process=df_process,
+                                                ),
                                                 "child_normalized_args": child_args_norm,
-                                                "child_actual_args": str(child_args)[:200] if child_args else "",
                                                 "similarity_score": f"{max_similarity:.2f}",
-                                                "most_similar_baseline": (
-                                                    str(best_baseline_arg)[:100]
-                                                    if best_baseline_arg else ""
-                                                )
+                                                "most_similar_baseline": str(best_baseline_arg) if best_baseline_arg else "",
+                                                "all_baseline_args_for_proc": [str(a) for a in baseline_args_for_proc[:20]],
                                             }
                                         )
                                     )
@@ -2925,14 +3084,14 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                         'pid': int(row['Pid']) if pd.notna(row['Pid']) else 0,
                         'user': user,
                         'signer': signer,
-                        'process_args': str(row.get('ProcessArgs', ''))[:200],
+                        'process_args': str(row.get('ProcessArgs', '')),
                         'anomaly_count': len(anomalies),
                         'max_confidence_score': float(max_confidence),
                         
                          # NEW: Add parent process context
                         'ParentProcessName': row.get('ParentProcessName'),
                         'ParentProcessDir': row.get('ParentProcessDir'),
-                        'ParentProcessArgs': str(row.get('ParentProcessArgs', ''))[:200] if pd.notna(row.get('ParentProcessArgs')) else None,
+                        'ParentProcessArgs': str(row.get('ParentProcessArgs', '')) if pd.notna(row.get('ParentProcessArgs')) else None,
                         'ParentProcessSigner': row.get('ParentProcessSigner'),
                         'ParentProcessClassification': row.get('ParentProcessClassification'),
                         'ParentProcessIntegrityLevel': row.get('ParentProcessIntegrityLevel'),
@@ -2983,6 +3142,97 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
 
 
 
+    def _anomalous_item(self, anomaly: dict) -> dict:
+        """
+        Return a single dict describing exactly what was anomalous —
+        one consistent key in the JSON regardless of alert type.
+        """
+        a_type  = anomaly.get("type") or ""
+        obs     = anomaly.get("observed") or {}
+
+        if "ALERT_NEW_SPAWNED_PROCESS" in a_type or "ALERT_SPAWNED_PROCESS_UNUSUAL_ARGS" in a_type:
+            return {
+                "process":     anomaly.get("child_process"),
+                "args":        anomaly.get("child_args"),
+                "hash":        anomaly.get("child_hash"),
+                "signer":      anomaly.get("child_signer"),
+                "dir":         anomaly.get("child_dir"),
+                "normalized_args": anomaly.get("child_normalized_args"),
+                "similarity_to_baseline": anomaly.get("similarity_score"),
+            }
+
+        if "ALERT_NEW_DOMAINS" in a_type:
+            return {"new_domains": anomaly.get("new_domains", [])}
+
+        if "ALERT_NEW_IPS" in a_type:
+            return {
+                "new_ips": [a.get("ip") for a in (anomaly.get("new_ips_analysis") or [])],
+                "new_ips_analysis": anomaly.get("new_ips_analysis", []),
+            }
+
+        if "ALERT_NEW_PORTS" in a_type:
+            return {"new_ports": anomaly.get("new_ports", [])}
+
+        if "ALERT_NEW_DIRECTORIES" in a_type:
+            return {"new_directories": anomaly.get("new_directories", [])}
+
+        if "ALERT_NEW_FILE_EXTENSIONS" in a_type:
+            return {
+                "new_extensions":       anomaly.get("new_extensions", []),
+                "high_risk_extensions": anomaly.get("high_risk_extensions", []),
+            }
+
+        if "ALERT_ACCESSING_MANY_NEW_FILES" in a_type:
+            return {"new_files": anomaly.get("new_files_sample", [])}
+
+        if "ALERT_PROCESS_RUNNING_FROM_NEW_LOCATION" in a_type:
+            return {"new_process_dir": anomaly.get("current_process_dir")}
+
+        if "ALERT_NEW_USER_FOR_PROCESS" in a_type:
+            return {"new_user": anomaly.get("current_user")}
+
+        if "ALERT_PROCESS_SIGNER_CHANGED" in a_type:
+            return {"new_signer": anomaly.get("current_signer")}
+
+        if "ALERT_EXCESSIVE_TRANSFER" in a_type:
+            return {
+                "bytes_sent":     anomaly.get("bytes_sent"),
+                "bytes_received": anomaly.get("bytes_received"),
+                "z_score":        anomaly.get("z_score"),
+            }
+
+        if "ALERT_ELEVATED_PRIVILEGES" in a_type:
+            return {
+                "integrity_level": anomaly.get("current_integrity_level"),
+                "delta_rank":      anomaly.get("delta_rank"),
+            }
+
+        if "ALERT_UNUSUAL_PARENT_FOR_PROCESS" in a_type:
+            return {"unusual_parent": anomaly.get("current_parent", {})}
+
+        if "ALERT_NEW_MODEL_FILE_MODIFICATION" in a_type:
+            return {
+                "file":             anomaly.get("file"),
+                "modifying_user":   anomaly.get("modifying_user"),
+                "modifying_args":   anomaly.get("modifying_process_args"),
+            }
+
+        if "ALERT_MODEL_FILE_MODIFIED_BY_NEW_USER" in a_type:
+            return {
+                "file":         anomaly.get("file"),
+                "new_user":     anomaly.get("current_user"),
+            }
+
+        if "ALERT_MODEL_FILE_MODIFIED_WITH_UNUSUAL_ARGS" in a_type:
+            return {
+                "file":                   anomaly.get("file"),
+                "args":                   anomaly.get("current_args"),
+                "similarity_to_baseline": anomaly.get("similarity_to_best_baseline"),
+            }
+
+        # Fallback — return the details string so there's always something
+        return {"details": anomaly.get("details", "")}
+
     def save_alerts(self, alerts_df):
         """Save alerts with confidence scores"""
         if len(alerts_df) == 0:
@@ -2990,6 +3240,7 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
             return
         
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        
         filepath = os.path.join(self.output_dir, 'alerts', f'alerts_{timestamp}.csv')
         
         alerts_flat = []
@@ -3018,6 +3269,12 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                     'global_baseline_key': (anomaly.get('baseline_context') or {}).get('global_baseline_key'),
 
                     'anomaly_json': self._to_json_str(anomaly),
+                    # Spawned-process identity & activity (populated for ALERT_NEW_SPAWNED_PROCESS)
+                    'spawned_process_args':     anomaly.get('spawned_process_args') or anomaly.get('child_args', ''),
+                    'spawned_process_hash':     anomaly.get('child_hash', ''),
+                    'spawned_process_signer':   anomaly.get('child_signer', ''),
+                    'spawned_process_dir':      anomaly.get('child_dir', ''),
+                    'spawned_process_activity': self._to_json_str(anomaly.get('child_activity', {})),
                     'ParentProcessName': alert.get('ParentProcessName'),
                     'ParentProcessDir': alert.get('ParentProcessDir'),
                     'ParentProcessArgs': alert.get('ParentProcessArgs'),
@@ -3077,13 +3334,130 @@ usesAIServingPort = toint(NetworkDestPort in (CommonAIServingPorts) or NetworkSr
                     log_file.write(log_entry + '\n')
         
         print(f"💾 Saved {len(alerts_flat)} alerts in Check Point format to {log_filepath}")
-    
-        
+
+        # ── One JSON file per alert ──────────────────────────────────────────────
+        json_dir = os.path.join(self.output_dir, 'alerts')
+        json_count = 0
+        for _, alert in alerts_df.iterrows():
+            for anomaly in alert['anomalies']:
+                alert_id   = self._alert_id(alert, anomaly)
+                alert_type = anomaly.get('type', 'UNKNOWN')
+
+                obs = anomaly.get("observed") or {}
+                bc  = anomaly.get("baseline_context") or {}
+                json_payload = {
+                    # ── What was the alert ────────────────────────────────────────
+                    "alert": {
+                        "alert_id":               alert_id,
+                        "alert_type":             alert_type,
+                        "severity":               anomaly.get("severity", "UNKNOWN"),
+                        "details":                anomaly.get("details", ""),
+                        "confidence_score":       anomaly.get("confidence_score", 0.0),
+                        "alert_max_confidence":   alert.get("max_confidence_score", 0.0),
+                        "timestamp":              str(alert.get("timestamp", "")),
+                        "machine":                self._obfuscate_machine_name(str(alert.get("machine", ""))),
+                        "process":                alert.get("process", ""),
+                        "process_args":           alert.get("process_args", ""),
+                        "process_hash":           (
+                            alert.get("ProcessHash")
+                            or obs.get("process_hash")
+                        ),
+                        "process_classification": (alert.get("ProcessClassification") or obs.get("ProcessClassification")),
+                        "process_integrity_level": alert.get("ProcessIntegrityLevel"),
+                        "pid":                    alert.get("pid"),
+                        "user":                   self._obfuscate_user_name(str(alert.get("user", ""))),
+                        "signer":                 alert.get("signer", "UNKNOWN"),
+                        "domain_name":            (alert.get("DomainName") or obs.get("DomainName")),
+                        "user_sid":               (alert.get("UserSID") or obs.get("UserSID")),
+                        "first_seen":             (alert.get("FirstSeenInPeriod") or obs.get("FirstSeenInPeriod")),
+                        "last_seen":              (alert.get("LastSeenInPeriod") or obs.get("LastSeenInPeriod")),
+                        "bytes_sent":             (
+                            alert.get("BytesSent")
+                            or obs.get("network_bytes_sent")
+                            or (anomaly.get("observed_row_full") or {}).get("NetworkBytesSent_sum")
+                        ),
+                        "bytes_received":         (
+                            alert.get("BytesReceived")
+                            or obs.get("network_bytes_received")
+                            or (anomaly.get("observed_row_full") or {}).get("NetworkBytesReceived_sum")
+                        ),
+                        "mitre_attack":           anomaly.get("mitre_attack", []),
+                        "ai_risk":                anomaly.get("ai_risk", []),
+                        "soc_runbook":            anomaly.get("soc_runbook", {}),
+                    },
+
+                    # ── Parent process context ────────────────────────────────────
+                    "parent_process": {k: v for k, v in {
+                        "name":               alert.get("ParentProcessName"),
+                        "dir":                alert.get("ParentProcessDir"),
+                        "args":               alert.get("ParentProcessArgs"),
+                        "signer":             alert.get("ParentProcessSigner"),
+                        "classification":     alert.get("ParentProcessClassification"),
+                        "integrity_level":    alert.get("ParentProcessIntegrityLevel"),
+                        "md5":                alert.get("ParentProcessMD5"),
+                        "ppid_creation_time": alert.get("ProcessPPidCreationTime"),
+                    }.items() if v is not None},
+
+                    # ── What is the anomaly (observed behaviour + alert-specific fields) ──
+                    "anomaly": {
+                        # Always present
+                        "observed":              obs,
+                        "baseline_context":      bc,
+                        "tenant_baseline_match": bool(bc.get("tenant_baseline_match")),
+                        "tenant_baseline_key":   bc.get("tenant_baseline_key"),
+                        "global_baseline_match": bool(bc.get("global_baseline_match")),
+                        "global_baseline_key":   bc.get("global_baseline_key"),
+                        # Spawned-process fields — always written for spawned-process alerts,
+                        # null when not available so the reader knows the field was checked
+                        **({
+                            "child_process":              anomaly.get("child_process"),
+                            "child_args":                 anomaly.get("child_args"),
+                            "child_hash":                 anomaly.get("child_hash"),
+                            "child_signer":               anomaly.get("child_signer"),
+                            "child_dir":                  anomaly.get("child_dir"),
+                            "child_machine":              anomaly.get("child_machine"),
+                            "child_pid_creation_time":    anomaly.get("child_pid_creation_time"),
+                            "child_normalized_args":      anomaly.get("child_normalized_args"),
+                            "child_activity":             anomaly.get("child_activity"),
+                            "similarity_score":           anomaly.get("similarity_score"),
+                            "most_similar_baseline":      anomaly.get("most_similar_baseline"),
+                            "all_baseline_args_for_proc": anomaly.get("all_baseline_args_for_proc"),
+                        } if "SPAWNED" in alert_type else {}),
+                    },
+
+                    # ── What is in the baseline ───────────────────────────────────
+                    "baseline": {
+                        "summary":  anomaly.get("baseline_snapshot", {}),
+                        "relevant": self._baseline_relevant_json(anomaly),
+                    },
+
+                    # ── The single anomalous item that triggered this alert ────────
+                    "anomalous_item": self._anomalous_item(anomaly),
+                }
+
+                json_path = os.path.join(json_dir, f"alert_{alert_id}.json")
+                try:
+                    with open(json_path, 'w', encoding='utf-8') as jf:
+                        json.dump(self._safe_json_value(json_payload), jf, indent=2, default=str)
+                    json_count += 1
+                except Exception as e:
+                    print(f"⚠️ Failed to write JSON for alert {alert_id}: {e}")
+
+        print(f"💾 Saved {json_count} individual alert JSON files to {json_dir}")
+
         if 'confidence_score' in df_flat.columns:
             high = len(df_flat[df_flat['confidence_score'] >= 0.8])
             med = len(df_flat[(df_flat['confidence_score'] >= 0.5) & (df_flat['confidence_score'] < 0.8)])
             low = len(df_flat[df_flat['confidence_score'] < 0.5])
             print(f"  📊 High (≥0.8): {high}, Med (0.5-0.8): {med}, Low (<0.5): {low}")
+            
+                
+        incidents_path = os.path.join(self.output_dir, 'incidents')
+        reports_path = os.path.join(self.output_dir, 'reports')
+        
+        analyzer = IncidentAnalyzer2()
+        analyzer.analyze_alerts_from_json_dir (json_dir=json_dir, output_dir=incidents_path, max_incidents=100)
+        
     
     
 
